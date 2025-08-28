@@ -82,6 +82,7 @@ avian_derive = { path = "../avian_derive", version = "0.2" }
 bevy = { version = "0.16", default-features = false, features = [
     "std",
     "bevy_log",
+    "png",
 ] }
 bevy_math = { version = "0.16", features = ["approx"] }
 glam_matrix_extensions = { git = "https://github.com/Jondolf/glam_matrix_extensions", features = [
