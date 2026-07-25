@@ -9,7 +9,7 @@ use crate::{
     },
     collision::collider::{ColliderAabbMargin, EnlargedAabb},
     data_structures::bit_vec::BitVec,
-    dynamics::solver::solver_body::SolverBody,
+    dynamics::solver::solver_body::SolverBodyIndex,
     prelude::*,
     schedule::LastPhysicsTick,
     utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
@@ -652,6 +652,8 @@ impl EnlargedProxiesBitVec {
 
 /// Updates the AABBs of the colliders of each [`SolverBody`] (awake dynamic and kinematic bodies)
 /// after the physics step.
+///
+/// [`SolverBody`]: crate::dynamics::solver::solver_body::SolverBody
 // TODO: Once dynamic an kinematic bodies have their own marker components,
 //       we should use those instead of `SolverBody`. Solver bodies should
 //       be an implementation detail of the solver.
@@ -665,7 +667,7 @@ fn update_solver_body_aabbs<C: AnyCollider>(
             &RigidBodyColliders,
             Option<&SpeculativeCcd>,
         ),
-        With<SolverBody>,
+        With<SolverBodyIndex>,
     >,
     mut colliders: ParamSet<(
         Query<
