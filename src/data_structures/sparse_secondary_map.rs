@@ -15,11 +15,11 @@ use core::mem::MaybeUninit;
 use std::collections::hash_map::{self, HashMap};
 use std::hash;
 
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityGeneration};
 
 #[derive(Debug, Clone)]
 struct Slot<T> {
-    generation: u32,
+    generation: EntityGeneration,
     value: T,
 }
 
@@ -124,7 +124,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
     #[inline]
     pub fn contains(&self, entity: Entity) -> bool {
         self.slots
-            .get(&entity.index())
+            .get(&entity.index_u32())
             .is_some_and(|slot| slot.generation == entity.generation())
     }
 
@@ -138,7 +138,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
             return None;
         }
 
-        let (index, generation) = (entity.index(), entity.generation());
+        let (index, generation) = (entity.index_u32(), entity.generation());
 
         if let Some(slot) = self.slots.get_mut(&index) {
             if slot.generation == generation {
@@ -146,7 +146,12 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
             }
 
             // Don't replace existing newer values.
-            if is_older_generation(generation, slot.generation) {
+            if unsafe {
+                is_older_generation(
+                    core::mem::transmute::<EntityGeneration, u32>(generation),
+                    core::mem::transmute::<EntityGeneration, u32>(slot.generation),
+                )
+            } {
                 return None;
             }
 
@@ -164,7 +169,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
     /// the entity was not previously removed.
     #[inline]
     pub fn remove(&mut self, entity: Entity) -> Option<V> {
-        if let hash_map::Entry::Occupied(entry) = self.slots.entry(entity.index())
+        if let hash_map::Entry::Occupied(entry) = self.slots.entry(entity.index_u32())
             && entry.get().generation == entity.generation()
         {
             return Some(entry.remove_entry().1.value);
@@ -183,7 +188,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
     #[inline]
     pub fn get(&self, entity: Entity) -> Option<&V> {
         self.slots
-            .get(&entity.index())
+            .get(&entity.index_u32())
             .filter(|slot| slot.generation == entity.generation())
             .map(|slot| &slot.value)
     }
@@ -205,7 +210,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut V> {
         self.slots
-            .get_mut(&entity.index())
+            .get_mut(&entity.index_u32())
             .filter(|slot| slot.generation == entity.generation())
             .map(|slot| &mut slot.value)
     }
@@ -233,7 +238,7 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
     {
         if let Some(slot) = self
             .slots
-            .get(&entity.index())
+            .get(&entity.index_u32())
             .filter(|s| s.generation == entity.generation())
         {
             slot.value
@@ -260,14 +265,16 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
         while i < N {
             let entity = entities[i];
 
-            match self.slots.get_mut(&entity.index()) {
+            match self.slots.get_mut(&entity.index_u32()) {
                 Some(Slot { generation, value }) if *generation == entity.generation() => {
                     // This entity is valid, and the slot is occupied. Temporarily
                     // make the generation even so duplicate keys would show up as
                     // invalid, since keys always have an odd generation. This
                     // gives us a linear time disjointness check.
                     ptrs[i] = MaybeUninit::new(&mut *value);
-                    *generation ^= 1;
+                    unsafe {
+                        *core::mem::transmute::<&mut EntityGeneration, &mut u32>(generation) ^= 1;
+                    }
                 }
 
                 _ => break,
@@ -278,10 +285,10 @@ impl<V, S: hash::BuildHasher> SparseSecondaryEntityMap<V, S> {
 
         // Undo temporary even versions.
         for entity in &entities[0..i] {
-            match self.slots.get_mut(&entity.index()) {
-                Some(Slot { generation, .. }) => {
-                    *generation ^= 1;
-                }
+            match self.slots.get_mut(&entity.index_u32()) {
+                Some(Slot { generation, .. }) => unsafe {
+                    *core::mem::transmute::<&mut EntityGeneration, &mut u32>(generation) ^= 1;
+                },
                 _ => unsafe { core::hint::unreachable_unchecked() },
             }
         }

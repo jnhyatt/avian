@@ -7,15 +7,25 @@
 mod configuration;
 mod gizmos;
 
+use bevy_math::bounding::Aabb3d;
 pub use configuration::*;
 pub use gizmos::*;
 
-use crate::{dynamics::joints::EntityConstraint, prelude::*};
+use crate::{
+    collider_tree::ColliderTrees,
+    dynamics::{
+        joints::EntityConstraint,
+        solver::{
+            islands::{BodyIslandNode, PhysicsIslands},
+            solver_body::{SolverBodies, SolverBodyFlags, SolverBodyIndex},
+        },
+    },
+    prelude::*,
+};
 use bevy::{
+    camera::visibility::VisibilitySystems,
     ecs::{
-        intern::Interned,
         query::Has,
-        schedule::ScheduleLabel,
         system::{StaticSystemParam, SystemParam, SystemParamItem},
     },
     prelude::*,
@@ -34,6 +44,8 @@ use bevy::{
 /// - [Joints](dynamics::joints)
 /// - [`RayCaster`]
 /// - [`ShapeCaster`]
+/// - [Simulation islands](dynamics::solver::islands)
+/// - [Collider tree](crate::collider_tree) nodes
 /// - Changing the visibility of entities to only show debug rendering
 ///
 /// By default, [AABBs](ColliderAabb) and [contacts](ContactPair) are not debug rendered.
@@ -53,7 +65,7 @@ use bevy::{
 ///             DefaultPlugins,
 ///             PhysicsPlugins::default(),
 ///             // Enables debug rendering
-///             PhysicsDebugPlugin::default(),
+///             PhysicsDebugPlugin,
 ///         ))
 ///         // Overwrite default debug rendering configuration (optional)
 ///         .insert_gizmo_config(
@@ -77,26 +89,8 @@ use bevy::{
 ///     ));
 /// }
 /// ```
-pub struct PhysicsDebugPlugin {
-    schedule: Interned<dyn ScheduleLabel>,
-}
-
-impl PhysicsDebugPlugin {
-    /// Creates a [`PhysicsDebugPlugin`] with the schedule that is used for running the [`PhysicsSchedule`].
-    ///
-    /// The default schedule is `FixedPostUpdate`.
-    pub fn new(schedule: impl ScheduleLabel) -> Self {
-        Self {
-            schedule: schedule.intern(),
-        }
-    }
-}
-
-impl Default for PhysicsDebugPlugin {
-    fn default() -> Self {
-        Self::new(PostUpdate)
-    }
-}
+#[derive(Default)]
+pub struct PhysicsDebugPlugin;
 
 impl Plugin for PhysicsDebugPlugin {
     fn build(&self, app: &mut App) {
@@ -113,50 +107,47 @@ impl Plugin for PhysicsDebugPlugin {
             config.line.width = 1.5;
         }
 
-        app.register_type::<PhysicsGizmos>()
-            .register_type::<DebugRender>()
-            .add_systems(
-                self.schedule,
-                (
-                    debug_render_axes,
-                    debug_render_aabbs,
-                    #[cfg(all(
-                        feature = "default-collider",
-                        any(feature = "parry-f32", feature = "parry-f64")
-                    ))]
-                    debug_render_colliders,
-                    debug_render_contacts,
-                    // TODO: Refactor joints to allow iterating over all of them without generics
-                    debug_render_constraint::<FixedJoint, 2>,
-                    debug_render_constraint::<PrismaticJoint, 2>,
-                    debug_render_constraint::<DistanceJoint, 2>,
-                    debug_render_constraint::<RevoluteJoint, 2>,
-                    #[cfg(feature = "3d")]
-                    debug_render_constraint::<SphericalJoint, 2>,
-                    debug_render_raycasts,
-                    #[cfg(all(
-                        feature = "default-collider",
-                        any(feature = "parry-f32", feature = "parry-f64")
-                    ))]
-                    debug_render_shapecasts,
-                )
-                    .after(PhysicsSet::StepSimulation)
-                    .run_if(|store: Res<GizmoConfigStore>| {
-                        store.config::<PhysicsGizmos>().0.enabled
-                    }),
+        app.add_systems(
+            PostUpdate,
+            (
+                debug_render_axes,
+                debug_render_aabbs,
+                debug_render_bvh,
+                #[cfg(all(
+                    feature = "default-collider",
+                    any(feature = "parry-f32", feature = "parry-f64")
+                ))]
+                debug_render_colliders,
+                debug_render_contacts,
+                // TODO: Refactor joints to allow iterating over all of them without generics
+                debug_render_constraint::<FixedJoint, 2>,
+                debug_render_constraint::<PrismaticJoint, 2>,
+                debug_render_constraint::<DistanceJoint, 2>,
+                debug_render_constraint::<RevoluteJoint, 2>,
+                #[cfg(feature = "3d")]
+                debug_render_constraint::<SphericalJoint, 2>,
+                debug_render_raycasts,
+                #[cfg(all(
+                    feature = "default-collider",
+                    any(feature = "parry-f32", feature = "parry-f64")
+                ))]
+                debug_render_shapecasts,
+                debug_render_islands.run_if(resource_exists::<PhysicsIslands>),
             )
-            .add_systems(
-                self.schedule,
-                change_mesh_visibility.after(PhysicsSet::StepSimulation),
-            );
+                .after(TransformSystems::Propagate)
+                .run_if(|store: Res<GizmoConfigStore>| store.config::<PhysicsGizmos>().0.enabled),
+        )
+        .add_systems(
+            PostUpdate,
+            change_mesh_visibility.before(VisibilitySystems::CalculateBounds),
+        );
     }
 }
 
 #[allow(clippy::type_complexity)]
 fn debug_render_axes(
     bodies: Query<(
-        &Position,
-        &Rotation,
+        &GlobalTransform,
         &ComputedCenterOfMass,
         Has<Sleeping>,
         Option<&DebugRender>,
@@ -166,7 +157,10 @@ fn debug_render_axes(
     length_unit: Res<PhysicsLengthUnit>,
 ) {
     let config = store.config::<PhysicsGizmos>().1;
-    for (pos, rot, local_com, sleeping, render_config) in &bodies {
+    for (transform, local_com, sleeping, render_config) in &bodies {
+        let pos = Position::from(transform);
+        let rot = Rotation::from(transform);
+
         // If the body is sleeping, the colors will be multiplied by the sleeping color multiplier
         if let Some(mut lengths) = render_config.map_or(config.axis_lengths, |c| c.axis_lengths) {
             lengths *= length_unit.0;
@@ -185,17 +179,17 @@ fn debug_render_axes(
                 Color::hsla(120.0 * mul[0], 1.0 * mul[1], 0.4 * mul[2], 1.0 * mul[3]),
                 Color::hsla(220.0 * mul[0], 1.0 * mul[1], 0.6 * mul[2], 1.0 * mul[3]),
             ];
-            let global_com = pos.0 + rot * local_com.0;
+            let global_com = pos.0 + (rot * local_com.0).real();
 
-            let x = rot * (Vector::X * lengths.x);
+            let x = (rot * (Vector::X * lengths.x)).real();
             gizmos.draw_line(global_com - x, global_com + x, x_color);
 
-            let y = rot * (Vector::Y * lengths.y);
+            let y = (rot * (Vector::Y * lengths.y)).real();
             gizmos.draw_line(global_com - y, global_com + y, y_color);
 
             #[cfg(feature = "3d")]
             {
-                let z = rot * (Vector::Z * lengths.z);
+                let z = (rot * (Vector::Z * lengths.z)).real();
                 gizmos.draw_line(global_com - z, global_com + z, _z_color);
             }
         }
@@ -229,17 +223,15 @@ fn debug_render_aabbs(
                 }
             }
 
-            gizmos.cuboid(
-                Transform::from_scale(Vector::from(aabb.size()).extend(0.0).f32())
-                    .with_translation(Vector::from(aabb.center()).extend(0.0).f32()),
-                color,
-            );
+            gizmos.rect_2d(aabb.center().f32(), aabb.size(), color);
         }
     }
 
     #[cfg(feature = "3d")]
     for (entity, aabb, collider_rb, render_config) in &aabbs {
         if let Some(mut color) = render_config.map_or(config.aabb_color, |c| c.aabb_color) {
+            use bevy_math::bounding::Aabb3d;
+
             let collider_rb = collider_rb.map_or(entity, |c| c.body);
 
             // If the body is sleeping, multiply the color by the sleeping color multiplier
@@ -252,10 +244,35 @@ fn debug_render_aabbs(
                 }
             }
 
-            gizmos.cuboid(
-                Transform::from_scale(Vector::from(aabb.size()).f32())
-                    .with_translation(Vector::from(aabb.center()).f32()),
+            gizmos.aabb_3d(
+                Aabb3d {
+                    min: Vec3A::from(aabb.min),
+                    max: Vec3A::from(aabb.max),
+                },
+                Transform::IDENTITY,
                 color,
+            );
+        }
+    }
+}
+
+fn debug_render_bvh(
+    bvh: Res<ColliderTrees>,
+    mut gizmos: Gizmos<PhysicsGizmos>,
+    store: Res<GizmoConfigStore>,
+) {
+    let config = store.config::<PhysicsGizmos>().1;
+
+    let Some(collider_tree_color) = config.collider_tree_color else {
+        return;
+    };
+
+    for node in bvh.iter_trees().flat_map(|tree| tree.bvh.nodes.iter()) {
+        if node.prim_count == 0 && node.aabb.valid() {
+            gizmos.aabb_3d(
+                Aabb3d::from_min_max(node.aabb.min.to_array(), node.aabb.max.to_array()),
+                Transform::IDENTITY,
+                collider_tree_color,
             );
         }
     }
@@ -270,22 +287,44 @@ fn debug_render_colliders(
     mut colliders: Query<(
         Entity,
         &Collider,
-        &Position,
-        &Rotation,
+        &GlobalTransform,
         Option<&ColliderOf>,
         Option<&DebugRender>,
     )>,
     sleeping: Query<(), With<Sleeping>>,
+    body_indices: Query<&SolverBodyIndex>,
+    solver_bodies: Res<SolverBodies>,
     mut gizmos: Gizmos<PhysicsGizmos>,
     store: Res<GizmoConfigStore>,
 ) {
     let config = store.config::<PhysicsGizmos>().1;
-    for (entity, collider, position, rotation, collider_rb, render_config) in &mut colliders {
+    for (entity, collider, transform, collider_rb, render_config) in &mut colliders {
+        let position = Position::from(transform);
+        let rotation = Rotation::from(transform);
         if let Some(mut color) = render_config.map_or(config.collider_color, |c| c.collider_color) {
             let collider_rb = collider_rb.map_or(entity, |c| c.body);
 
-            // If the body is sleeping, multiply the color by the sleeping color multiplier
-            if sleeping.contains(collider_rb) {
+            let ccd_color = (render_config.is_none())
+                .then(|| body_indices.get(collider_rb).ok().copied())
+                .flatten()
+                .and_then(|index| solver_bodies.get(index))
+                .and_then(|solver_body| {
+                    if solver_body
+                        .flags
+                        .contains(SolverBodyFlags::HAD_TIME_OF_IMPACT)
+                    {
+                        config.time_of_impact_color
+                    } else if solver_body.flags.contains(SolverBodyFlags::IS_FAST) {
+                        config.fast_body_color
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(ccd_color) = ccd_color {
+                color = ccd_color;
+            } else if sleeping.contains(collider_rb) {
+                // If the body is sleeping, multiply the color by the sleeping color multiplier.
                 let hsla = Hsla::from(color).to_vec4();
                 if let Some(mul) = render_config.map_or(config.sleeping_color_multiplier, |c| {
                     c.sleeping_color_multiplier
@@ -293,7 +332,8 @@ fn debug_render_colliders(
                     color = Hsla::from_vec4(hsla * Vec4::from_array(mul)).into();
                 }
             }
-            gizmos.draw_collider(collider, *position, *rotation, color);
+
+            gizmos.draw_collider(collider, position.0, rotation, color);
         }
     }
 }
@@ -305,6 +345,7 @@ fn debug_render_contacts(
     time: Res<Time<Substeps>>,
     length_unit: Res<PhysicsLengthUnit>,
 ) {
+    let delta_secs = time.delta_secs();
     let config = store.config::<PhysicsGizmos>().1;
 
     if config.contact_point_color.is_none() && config.contact_normal_color.is_none() {
@@ -315,7 +356,7 @@ fn debug_render_contacts(
         for manifold in contacts.manifolds.iter() {
             for contact in manifold.points.iter() {
                 // Don't render contacts that aren't penetrating
-                if contact.penetration <= Scalar::EPSILON {
+                if contact.penetration <= f32::EPSILON {
                     continue;
                 }
 
@@ -338,14 +379,13 @@ fn debug_render_contacts(
                         * match config.contact_normal_scale {
                             ContactGizmoScale::Constant(length) => length,
                             ContactGizmoScale::Scaled(scale) => {
-                                scale * contact.normal_impulse
-                                    / time.delta_secs_f64().adjust_precision()
+                                scale * contact.normal_impulse / delta_secs
                             }
                         };
 
                     gizmos.draw_arrow(
                         contact.point,
-                        contact.point + manifold.normal * length,
+                        contact.point + (manifold.normal * length).real(),
                         0.1 * length_unit.0,
                         color,
                     );
@@ -365,7 +405,7 @@ pub trait DebugRenderConstraint<const N: usize>: EntityConstraint<N> {
     /// Renders the debug information for the constraint.
     fn debug_render(
         &self,
-        positions: [Vector; N],
+        positions: [RVector; N],
         rotations: [Rotation; N],
         context: &mut SystemParamItem<Self::Context>,
         gizmos: &mut Gizmos<PhysicsGizmos>,
@@ -375,7 +415,7 @@ pub trait DebugRenderConstraint<const N: usize>: EntityConstraint<N> {
 
 /// A system that renders all constraints that implement the [`DebugRenderConstraint`] trait.
 pub fn debug_render_constraint<T: Component + DebugRenderConstraint<N>, const N: usize>(
-    bodies: Query<(&Position, &Rotation)>,
+    bodies: Query<&GlobalTransform>,
     constraints: Query<&T>,
     mut gizmos: Gizmos<PhysicsGizmos>,
     store: Res<GizmoConfigStore>,
@@ -384,15 +424,15 @@ pub fn debug_render_constraint<T: Component + DebugRenderConstraint<N>, const N:
     let config = store.config::<PhysicsGizmos>().1;
     for constraint in &constraints {
         if let Ok(bodies) = bodies.get_many(constraint.entities()) {
-            let positions: [Vector; N] = bodies
+            let positions: [RVector; N] = bodies
                 .iter()
-                .map(|(pos, _)| pos.0)
+                .map(|transform| Position::from(**transform).0)
                 .collect::<Vec<_>>()
                 .try_into()
                 .unwrap();
             let rotations: [Rotation; N] = bodies
                 .iter()
-                .map(|(_, rot)| **rot)
+                .map(|transform| Rotation::from(**transform))
                 .collect::<Vec<_>>()
                 .try_into()
                 .unwrap();
@@ -462,6 +502,75 @@ fn debug_render_shapecasts(
     }
 }
 
+fn debug_render_islands(
+    islands: Res<PhysicsIslands>,
+    bodies: Query<(&RigidBodyColliders, &BodyIslandNode)>,
+    aabbs: Query<&ColliderAabb>,
+    mut gizmos: Gizmos<PhysicsGizmos>,
+    store: Res<GizmoConfigStore>,
+) {
+    let config = store.config::<PhysicsGizmos>().1;
+
+    for island in islands.iter() {
+        if let Some(mut color) = config.island_color {
+            // If the island is sleeping, multiply the color by the sleeping color multiplier
+            if island.is_sleeping {
+                let hsla = Hsla::from(color).to_vec4();
+                if let Some(mul) = config.sleeping_color_multiplier {
+                    color = Hsla::from_vec4(hsla * Vec4::from_array(mul)).into();
+                }
+            }
+
+            // If the island is empty, skip rendering
+            if island.body_count == 0 {
+                continue;
+            }
+
+            let mut body = island.head_body;
+            let mut aabb: Option<ColliderAabb> = None;
+
+            // Compute the island's AABB by merging the AABBs of all bodies in the island.
+            while let Some(next_body) = body {
+                if let Ok((colliders, body_island)) = bodies.get(next_body) {
+                    for collider in colliders.iter() {
+                        if let Ok(collider_aabb) = aabbs.get(collider) {
+                            aabb = Some(
+                                aabb.map_or(*collider_aabb, |aabb| aabb.merged(*collider_aabb)),
+                            );
+                        }
+                    }
+                    body = body_island.next;
+                } else {
+                    break;
+                }
+            }
+
+            let Some(aabb) = aabb else {
+                continue;
+            };
+
+            // Render the island's AABB.
+            #[cfg(feature = "2d")]
+            {
+                gizmos.rect_2d(aabb.center().f32(), aabb.size(), color);
+            }
+            #[cfg(feature = "3d")]
+            {
+                use bevy_math::bounding::Aabb3d;
+
+                gizmos.aabb_3d(
+                    Aabb3d {
+                        min: Vec3A::from(aabb.min),
+                        max: Vec3A::from(aabb.max),
+                    },
+                    Transform::IDENTITY,
+                    color,
+                );
+            }
+        }
+    }
+}
+
 type MeshVisibilityQueryFilter = (
     With<RigidBody>,
     Or<(Changed<DebugRender>, Without<DebugRender>)>,
@@ -479,7 +588,7 @@ fn change_mesh_visibility(
             if hide_mesh {
                 *visibility = Visibility::Hidden;
             } else {
-                *visibility = Visibility::Visible;
+                *visibility = Visibility::Inherited;
             }
         }
     }

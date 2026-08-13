@@ -196,7 +196,7 @@
 //! For example, [`MassPropertyHelper::total_mass_properties`] computes the total mass properties of an entity,
 //! taking into account the mass properties of descendants and colliders.
 
-use crate::physics_transform::PhysicsTransformSet;
+use crate::physics_transform::PhysicsTransformSystems;
 use crate::prelude::*;
 use bevy::{
     ecs::{intern::Interned, schedule::ScheduleLabel},
@@ -234,8 +234,8 @@ impl MassPropertiesExt for MassProperties {
         let angular_inertia = AngularInertia(self.angular_inertia);
         #[cfg(feature = "3d")]
         let angular_inertia = AngularInertia::new_with_local_frame(
-            self.principal_angular_inertia.f32(),
-            self.local_inertial_frame.f32(),
+            self.principal_angular_inertia,
+            self.local_inertial_frame,
         );
 
         MassPropertiesBundle {
@@ -276,37 +276,22 @@ impl Default for MassPropertyPlugin {
 
 impl Plugin for MassPropertyPlugin {
     fn build(&self, app: &mut App) {
-        app.register_type::<(
-            Mass,
-            AngularInertia,
-            CenterOfMass,
-            ComputedMass,
-            ComputedAngularInertia,
-            ComputedCenterOfMass,
-            ColliderDensity,
-            ColliderMassProperties,
-            NoAutoMass,
-            NoAutoAngularInertia,
-            NoAutoCenterOfMass,
-        )>();
-
         // TODO: We probably don't need this since we have the observer.
         // Force mass property computation for new rigid bodies.
         app.register_required_components::<RigidBody, RecomputeMassProperties>();
 
         // Compute mass properties for new rigid bodies at spawn.
         app.add_observer(
-            |trigger: Trigger<OnAdd, RigidBody>, mut mass_helper: MassPropertyHelper| {
-                mass_helper.update_mass_properties(trigger.target());
+            |trigger: On<Add, RigidBody>, mut mass_helper: MassPropertyHelper| {
+                mass_helper.update_mass_properties(trigger.entity);
             },
         );
 
         // Update the mass properties of rigid bodies when colliders added or removed.
         // TODO: Avoid duplicating work with the above observer.
         app.add_observer(
-            |trigger: Trigger<OnInsert, RigidBodyColliders>,
-             mut mass_helper: MassPropertyHelper| {
-                mass_helper.update_mass_properties(trigger.target());
+            |trigger: On<Insert, RigidBodyColliders>, mut mass_helper: MassPropertyHelper| {
+                mass_helper.update_mass_properties(trigger.entity);
             },
         );
 
@@ -319,8 +304,8 @@ impl Plugin for MassPropertyPlugin {
                 MassPropertySystems::UpdateComputedMassProperties,
             )
                 .chain()
-                .in_set(PhysicsSet::Prepare)
-                .after(PhysicsTransformSet::TransformToPosition),
+                .in_set(PhysicsSystems::Prepare)
+                .after(PhysicsTransformSystems::TransformToPosition),
         );
 
         // Queue mass property recomputation when mass properties are changed.
@@ -422,6 +407,15 @@ fn update_mass_properties(
     }
 }
 
+#[cfg(feature = "default-collider")]
+type ShouldWarn = (
+    Without<ColliderConstructor>,
+    Without<ColliderConstructorHierarchy>,
+);
+
+#[cfg(not(feature = "default-collider"))]
+type ShouldWarn = ();
+
 /// Logs warnings when dynamic bodies have invalid [`Mass`] or [`AngularInertia`].
 fn warn_invalid_mass(
     mut bodies: Query<
@@ -431,7 +425,10 @@ fn warn_invalid_mass(
             Ref<ComputedMass>,
             Ref<ComputedAngularInertia>,
         ),
-        Or<(Changed<ComputedMass>, Changed<ComputedAngularInertia>)>,
+        (
+            Or<(Changed<ComputedMass>, Changed<ComputedAngularInertia>)>,
+            ShouldWarn,
+        ),
     >,
 ) {
     for (entity, rb, mass, inertia) in &mut bodies {
@@ -453,7 +450,7 @@ fn warn_invalid_mass(
 
 #[cfg(test)]
 #[cfg(all(feature = "2d", feature = "default-collider"))]
-#[expect(clippy::unnecessary_cast)]
+#[allow(clippy::unnecessary_cast)]
 mod tests {
     use approx::assert_relative_eq;
 
@@ -462,6 +459,7 @@ mod tests {
     fn create_app() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, PhysicsPlugins::default(), TransformPlugin));
+        app.finish();
         app
     }
 
@@ -494,9 +492,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(*mass, ComputedMass::default());
-        assert_eq!(*angular_inertia, ComputedAngularInertia::default());
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), 0.0);
+        assert_relative_eq!(angular_inertia.value(), SymmetricTensor::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -515,12 +513,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, collider_mass_props.mass);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            collider_mass_props.angular_inertia
-        );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), collider_mass_props.mass);
+        assert_relative_eq!(angular_inertia.value(), collider_mass_props.angular_inertia);
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -542,12 +537,12 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            mass.value() as f32 * collider_mass_props.unit_angular_inertia()
+        assert_relative_eq!(mass.value(), 5.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
+            mass.value() * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -573,9 +568,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0);
-        assert_eq!(angular_inertia.value() as f32, 10.0);
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), 5.0);
+        assert_relative_eq!(angular_inertia.value(), 10.0);
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -599,12 +594,12 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0 + collider_mass_props.mass);
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(mass.value(), 5.0 + collider_mass_props.mass);
+        assert_relative_eq!(
+            angular_inertia.value(),
             5.0 * collider_mass_props.unit_angular_inertia() + collider_mass_props.angular_inertia
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -628,13 +623,13 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0 + 10.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(mass.value(), 5.0 + 10.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
             5.0 * collider_mass_props.unit_angular_inertia()
                 + 10.0 * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -655,9 +650,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(*mass, ComputedMass::default());
-        assert_eq!(*angular_inertia, ComputedAngularInertia::default());
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), 0.0);
+        assert_relative_eq!(angular_inertia.value(), SymmetricTensor::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -681,15 +676,15 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            mass.value() as f32
+        assert_relative_eq!(mass.value(), 5.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
+            mass.value()
                 * (5.0 * collider_mass_props.unit_angular_inertia()
                     + 10.0 * collider_mass_props.unit_angular_inertia())
                 / 15.0
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -714,12 +709,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, collider_mass_props.mass);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            collider_mass_props.angular_inertia
-        );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), collider_mass_props.mass);
+        assert_relative_eq!(angular_inertia.value(), collider_mass_props.angular_inertia);
+        assert_relative_eq!(center_of_mass.0, Vector::ZERO);
 
         // Add a child collider
         let child_collider = Collider::circle(2.0);
@@ -735,15 +727,15 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(
-            mass.value() as f32,
+        assert_relative_eq!(
+            mass.value(),
             collider_mass_props.mass + child_collider_mass_props.mass
         );
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(
+            angular_inertia.value(),
             collider_mass_props.angular_inertia + child_collider_mass_props.angular_inertia
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, Vector::ZERO);
 
         // Remove the child collider
         app.world_mut().entity_mut(child_entity).despawn();
@@ -753,12 +745,9 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, collider_mass_props.mass);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            collider_mass_props.angular_inertia
-        );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(mass.value(), collider_mass_props.mass);
+        assert_relative_eq!(angular_inertia.value(), collider_mass_props.angular_inertia);
+        assert_relative_eq!(center_of_mass.0, Vector::ZERO);
     }
 
     #[test]
@@ -784,12 +773,12 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            mass.value() as f32 * collider_mass_props.unit_angular_inertia()
+        assert_relative_eq!(mass.value(), 5.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
+            mass.value() * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
 
         // Change mass
         app.world_mut().entity_mut(body_entity).insert(Mass(10.0));
@@ -799,12 +788,12 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 10.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
-            mass.value() as f32 * collider_mass_props.unit_angular_inertia()
+        assert_relative_eq!(mass.value(), 10.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
+            mass.value() * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 
     #[test]
@@ -842,7 +831,7 @@ mod tests {
 
         let (mass, _, center_of_mass) = get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 10.0 + 5.0);
+        assert_relative_eq!(mass.value(), 10.0 + 5.0);
         assert_relative_eq!(
             center_of_mass.0,
             Vector::new(0.0, -1.0 / 3.0),
@@ -858,7 +847,7 @@ mod tests {
 
         let (mass, _, center_of_mass) = get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value(), 10.0 + 5.0);
+        assert_relative_eq!(mass.value(), 10.0 + 5.0);
         assert_relative_eq!(center_of_mass.0, Vector::new(0.0, 1.0));
     }
 
@@ -889,13 +878,13 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0 + 10.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(mass.value(), 5.0 + 10.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
             5.0 * collider_mass_props.unit_angular_inertia()
                 + 10.0 * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
 
         // Add `NoAutoMass`
         app.world_mut().entity_mut(body_entity).insert(NoAutoMass);
@@ -905,14 +894,14 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(mass.value(), 5.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
             5.0 * (5.0 * collider_mass_props.unit_angular_inertia()
                 + 10.0 * collider_mass_props.unit_angular_inertia())
                 / 15.0
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
 
         // Remove `NoAutoMass`
         app.world_mut()
@@ -924,12 +913,12 @@ mod tests {
         let (mass, angular_inertia, center_of_mass) =
             get_computed_mass_properties(app.world_mut(), body_entity);
 
-        assert_eq!(mass.value() as f32, 5.0 + 10.0);
-        assert_eq!(
-            angular_inertia.value() as f32,
+        assert_relative_eq!(mass.value(), 5.0 + 10.0);
+        assert_relative_eq!(
+            angular_inertia.value(),
             5.0 * collider_mass_props.unit_angular_inertia()
                 + 10.0 * collider_mass_props.unit_angular_inertia()
         );
-        assert_eq!(*center_of_mass, ComputedCenterOfMass::default());
+        assert_relative_eq!(center_of_mass.0, ComputedCenterOfMass::default());
     }
 }

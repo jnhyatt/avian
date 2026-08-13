@@ -1,7 +1,9 @@
 //! Common components and bundles for rigid bodies.
 
+pub mod body_size_metrics;
 pub mod forces;
 pub mod mass_properties;
+pub mod sleeping;
 
 // Components
 mod locked_axes;
@@ -22,7 +24,7 @@ use crate::{
     prelude::{forces::AccumulatedLocalAcceleration, *},
 };
 use bevy::{
-    ecs::{component::HookContext, world::DeferredWorld},
+    ecs::{lifecycle::HookContext, world::DeferredWorld},
     prelude::*,
 };
 use derive_more::From;
@@ -91,7 +93,6 @@ use derive_more::From;
 #[cfg_attr(feature = "3d", doc = "use avian3d::prelude::*;")]
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(feature = "f32")]
 /// fn accelerate_bodies(
 ///     mut query: Query<(&mut LinearVelocity, &mut AngularVelocity)>,
 ///     time: Res<Time>,
@@ -109,19 +110,15 @@ use derive_more::From;
 )]
 ///     }
 /// }
-/// # #[cfg(feature = "f64")]
-/// # fn main() {}
 /// ```
 ///
 /// For applying forces, impulses, and acceleration to dynamic bodies, see the [`forces`] module.
 ///
 /// Avian does not have a built-in character controller, so if you need one,
 /// you will need to implement it yourself or use a third party option.
-/// You can take a look at the [`basic_dynamic_character`] and [`basic_kinematic_character`]
-/// examples for a simple implementation.
+/// You can take a look at the [3D Examples] for implementations of basic kinematic and dynamic character controllers.
 ///
-/// [`basic_dynamic_character`]: https://github.com/Jondolf/avian/blob/42fb8b21c756a7f4dd91071597dc251245ddaa8f/crates/avian3d/examples/basic_dynamic_character.rs
-/// [`basic_kinematic_character`]: https://github.com/Jondolf/avian/blob/42fb8b21c756a7f4dd91071597dc251245ddaa8f/crates/avian3d/examples/basic_kinematic_character.rs
+/// [3D Examples]: https://github.com/avianphysics/avian/tree/081d2de15f526ada89bf642e3c3277c2c7784488/crates/avian3d/examples
 ///
 /// # Mass Properties
 ///
@@ -275,13 +272,16 @@ use derive_more::From;
     ComputedMass,
     ComputedAngularInertia,
     ComputedCenterOfMass,
+    // Used by continuous collision detection and other systems for computing
+    // some thresholds based on the size metrics of the body.
+    BodySizeMetrics,
     // Required for local forces and acceleration.
     AccumulatedLocalAcceleration,
     // TODO: We can remove these pre-solve deltas once joints don't use XPBD.
     PreSolveDeltaPosition,
     PreSolveDeltaRotation,
 )]
-#[component(on_add = RigidBody::on_add)]
+#[component(immutable, on_add = RigidBody::on_add)]
 pub enum RigidBody {
     /// Dynamic bodies are bodies that are affected by forces, velocity and collisions.
     #[default]
@@ -380,47 +380,6 @@ pub(crate) type RigidBodyActiveFilter = (Without<RigidBodyDisabled>, Without<Sle
 #[reflect(Debug, Component, Default)]
 pub struct RigidBodyDisabled;
 
-/// Indicates that a [rigid body](RigidBody) is not simulated by the physics engine until woken up again.
-/// This is done to improve performance and to help prevent small jitter that is typically present in collisions.
-///
-/// Bodies are marked as sleeping when their linear and angular velocity is below the [`SleepingThreshold`] for a time
-/// indicated by [`DeactivationTime`]. A sleeping body is woken up when an active body interacts with it through
-/// collisions or other constraints, or when gravity changes, or when the body's
-/// position, rotation, velocity, or external forces are modified.
-///
-/// Sleeping can be disabled for specific entities with the [`SleepingDisabled`] component,
-/// or for all entities by setting the [`SleepingThreshold`] to a negative value.
-#[derive(Reflect, Clone, Copy, Component, Debug, Default)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
-#[reflect(Debug, Component, Default)]
-pub struct Sleeping;
-
-/// How long the velocity of the body has been below the [`SleepingThreshold`],
-/// i.e. how long the body has been able to sleep.
-///
-/// See [`Sleeping`] for further information.
-#[derive(Reflect, Clone, Copy, Component, Debug, Default, PartialEq, From)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
-#[reflect(Debug, Component, Default, PartialEq)]
-pub struct TimeSleeping(pub Scalar);
-
-impl TimeSleeping {
-    /// Resets the time sleeping to zero.
-    #[inline]
-    pub fn reset(&mut self) {
-        self.0 = 0.0;
-    }
-}
-
-/// Indicates that the body can not be deactivated by the physics engine. See [`Sleeping`] for information about sleeping.
-#[derive(Reflect, Clone, Copy, Component, Debug, Default, PartialEq, Eq, From)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
-#[reflect(Debug, Component, Default, PartialEq)]
-pub struct SleepingDisabled;
-
 /// The linear velocity of a [rigid body](RigidBody), typically in meters per second.
 ///
 /// # Example
@@ -430,7 +389,6 @@ pub struct SleepingDisabled;
 #[cfg_attr(feature = "3d", doc = "use avian3d::prelude::*;")]
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(feature = "f32")]
 /// fn accelerate_linear(mut query: Query<&mut LinearVelocity>, time: Res<Time>) {
 ///     let delta_secs = time.delta_secs();
 ///     for mut linear_velocity in &mut query {
@@ -438,8 +396,6 @@ pub struct SleepingDisabled;
 ///         linear_velocity.x += 2.0 * delta_secs;
 ///     }
 /// }
-/// # #[cfg(feature = "f64")]
-/// # fn main() {}
 /// ```
 ///
 /// # Related Components
@@ -480,11 +436,11 @@ impl LinearVelocity {
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
 #[doc(alias = "MaxLinearVelocity")]
-pub struct MaxLinearSpeed(pub Scalar);
+pub struct MaxLinearSpeed(pub f32);
 
 impl Default for MaxLinearSpeed {
     fn default() -> Self {
-        Self(Scalar::INFINITY)
+        Self(f32::INFINITY)
     }
 }
 
@@ -510,11 +466,11 @@ impl Default for MaxLinearSpeed {
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
 #[doc(alias = "MaxAngularVelocity")]
-pub struct MaxAngularSpeed(pub Scalar);
+pub struct MaxAngularSpeed(pub f32);
 
 impl Default for MaxAngularSpeed {
     fn default() -> Self {
-        Self(Scalar::INFINITY)
+        Self(f32::INFINITY)
     }
 }
 
@@ -527,7 +483,6 @@ impl Default for MaxAngularSpeed {
 /// use avian2d::prelude::*;
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(feature = "f32")]
 /// fn accelerate_angular(mut query: Query<&mut AngularVelocity>, time: Res<Time>) {
 ///     let delta_secs = time.delta_secs();
 ///     for mut angular_velocity in &mut query {
@@ -535,8 +490,6 @@ impl Default for MaxAngularSpeed {
 ///         angular_velocity.0 += 0.5 * delta_secs;
 ///     }
 /// }
-/// # #[cfg(feature = "f64")]
-/// # fn main() {}
 /// ```
 ///
 /// # Related Components
@@ -549,7 +502,7 @@ impl Default for MaxAngularSpeed {
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
-pub struct AngularVelocity(pub Scalar);
+pub struct AngularVelocity(pub f32);
 
 /// The angular velocity of a [rigid body](RigidBody), represented as a rotation axis
 /// multiplied by the angular speed in radians per second.
@@ -560,7 +513,6 @@ pub struct AngularVelocity(pub Scalar);
 /// use avian3d::prelude::*;
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(feature = "f32")]
 /// fn accelerate_angular(mut query: Query<&mut AngularVelocity>, time: Res<Time>) {
 ///     let delta_secs = time.delta_secs();
 ///     for mut angular_velocity in &mut query {
@@ -568,8 +520,6 @@ pub struct AngularVelocity(pub Scalar);
 ///         angular_velocity.z += 0.5 * delta_secs;
 ///     }
 /// }
-/// # #[cfg(feature = "f64")]
-/// # fn main() {}
 /// ```
 ///
 /// # Related Components
@@ -614,7 +564,7 @@ impl AngularVelocity {
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
-pub struct GravityScale(pub Scalar);
+pub struct GravityScale(pub f32);
 
 impl Default for GravityScale {
     fn default() -> Self {
@@ -644,7 +594,7 @@ impl Default for GravityScale {
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
-pub struct LinearDamping(pub Scalar);
+pub struct LinearDamping(pub f32);
 
 /// Automatically slows down a dynamic [rigid body](RigidBody), decreasing its
 /// [angular velocity](AngularVelocity) each frame. This can be used to simulate air resistance.
@@ -668,7 +618,7 @@ pub struct LinearDamping(pub Scalar);
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, Component, Default, PartialEq)]
-pub struct AngularDamping(pub Scalar);
+pub struct AngularDamping(pub f32);
 
 /// **Dominance** allows [dynamic rigid bodies](RigidBody::Dynamic) to dominate
 /// each other during physical interactions.

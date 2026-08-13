@@ -1,6 +1,6 @@
 use bevy::{diagnostic::DiagnosticPath, prelude::*};
 
-use crate::{ColliderMarker, PhysicsSchedule, PhysicsStepSet, RigidBody, dynamics::joints::*};
+use crate::{ColliderMarker, PhysicsSchedule, PhysicsStepSystems, RigidBody, dynamics::joints::*};
 
 use super::{AppDiagnosticsExt, PhysicsDiagnostics, impl_diagnostic_paths};
 
@@ -15,7 +15,7 @@ impl Plugin for PhysicsEntityDiagnosticsPlugin {
 
         app.add_systems(
             PhysicsSchedule,
-            diagnostic_entity_counts.in_set(PhysicsStepSet::First),
+            diagnostic_entity_counts.in_set(PhysicsStepSystems::First),
         );
     }
 }
@@ -58,7 +58,6 @@ impl_diagnostic_paths! {
     }
 }
 
-// TODO: This is pretty inefficient.
 fn diagnostic_entity_counts(
     rigid_bodies_query: Query<&RigidBody>,
     colliders_query: Query<&ColliderMarker>,
@@ -69,25 +68,27 @@ fn diagnostic_entity_counts(
     #[cfg(feature = "3d")] spherical_joint_query: Query<&SphericalJoint>,
     mut diagnostics: ResMut<PhysicsEntityDiagnostics>,
 ) {
-    diagnostics.dynamic_body_count = rigid_bodies_query
-        .iter()
-        .filter(|rb| rb.is_dynamic())
-        .count() as u32;
-    diagnostics.kinematic_body_count = rigid_bodies_query
-        .iter()
-        .filter(|rb| rb.is_kinematic())
-        .count() as u32;
-    diagnostics.static_body_count = rigid_bodies_query
-        .iter()
-        .filter(|rb| rb.is_static())
-        .count() as u32;
-    diagnostics.collider_count = colliders_query.iter().count() as u32;
-    diagnostics.joint_count = fixed_joint_query.iter().count() as u32
-        + prismatic_joint_query.iter().count() as u32
-        + distance_joint_query.iter().count() as u32
-        + revolute_joint_query.iter().count() as u32;
+    // Count the body types in a single pass.
+    let (mut dynamic, mut kinematic, mut static_) = (0, 0, 0);
+    for rb in &rigid_bodies_query {
+        match rb {
+            RigidBody::Dynamic => dynamic += 1,
+            RigidBody::Kinematic => kinematic += 1,
+            RigidBody::Static => static_ += 1,
+        }
+    }
+    diagnostics.dynamic_body_count = dynamic;
+    diagnostics.kinematic_body_count = kinematic;
+    diagnostics.static_body_count = static_;
+
+    // These are archetypal queries, so counting them does not iterate the entities.
+    diagnostics.collider_count = colliders_query.count() as u32;
+    diagnostics.joint_count = fixed_joint_query.count() as u32
+        + prismatic_joint_query.count() as u32
+        + distance_joint_query.count() as u32
+        + revolute_joint_query.count() as u32;
     #[cfg(feature = "3d")]
     {
-        diagnostics.joint_count += spherical_joint_query.iter().count() as u32;
+        diagnostics.joint_count += spherical_joint_query.count() as u32;
     }
 }

@@ -1,13 +1,12 @@
 use crate::prelude::*;
 use bevy::{
     ecs::{
-        component::HookContext,
         entity::{EntityMapper, MapEntities},
+        lifecycle::HookContext,
         world::DeferredWorld,
     },
     prelude::*,
 };
-use parry::query::{ShapeCastOptions, details::TOICompositeShapeShapeBestFirstVisitor};
 
 /// A component used for [shapecasting](spatial_query#shapecasting).
 ///
@@ -25,22 +24,35 @@ use parry::query::{ShapeCastOptions, details::TOICompositeShapeShapeBestFirstVis
 /// The [`ShapeCaster`] is the easiest way to handle simple shapecasting. If you want more control and don't want
 /// to perform shapecasts on every frame, consider using the [`SpatialQuery`] system parameter.
 ///
+/// # Hit Count and Order
+///
+/// The results of a shapecast are in an arbitrary order by default. You can iterate over them in the order of
+/// distance with the [`ShapeHits::iter_sorted`] method.
+///
+/// You can configure the maximum amount of hits for a shapecast using `max_hits`. By default this is unbounded,
+/// so you will get all hits. When the number or complexity of colliders is large, this can be very
+/// expensive computationally. Set the value to whatever works best for your case.
+///
+/// Note that when there are more hits than `max_hits`, **some hits will be missed**.
+/// To guarantee that the closest hit is included, you should set `max_hits` to one or a value that
+/// is enough to contain all hits.
+///
 /// # Example
 ///
 /// ```
 /// # #[cfg(feature = "2d")]
 /// # use avian2d::prelude::*;
 /// # #[cfg(feature = "3d")]
-/// use avian3d::prelude::*;
+/// use avian3d::{math::RVec3, prelude::*};
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(all(feature = "3d", feature = "f32"))]
+/// # #[cfg(feature = "3d")]
 /// fn setup(mut commands: Commands) {
 ///     // Spawn a shape caster with a ball shape moving right starting from the origin
 ///     commands.spawn(ShapeCaster::new(
 #[cfg_attr(feature = "2d", doc = "        Collider::circle(0.5),")]
 #[cfg_attr(feature = "3d", doc = "        Collider::sphere(0.5),")]
-///         Vec3::ZERO,
+///         RVec3::ZERO,
 ///         Quat::default(),
 ///         Dir3::X,
 ///     ));
@@ -72,32 +84,19 @@ pub struct ShapeCaster {
     /// of the shape caster entity or its parent.
     ///
     /// To get the global origin, use the `global_origin` method.
-    pub origin: Vector,
+    pub origin: RVector,
 
     /// The global origin of the shape.
-    global_origin: Vector,
+    global_origin: RVector,
 
     /// The local rotation of the shape being cast relative to the [`Rotation`]
     /// of the shape caster entity or its parent. Expressed in radians.
     ///
     /// To get the global shape rotation, use the `global_shape_rotation` method.
-    #[cfg(feature = "2d")]
-    pub shape_rotation: Scalar,
-
-    /// The local rotation of the shape being cast relative to the [`Rotation`]
-    /// of the shape caster entity or its parent.
-    ///
-    /// To get the global shape rotation, use the `global_shape_rotation` method.
-    #[cfg(feature = "3d")]
-    pub shape_rotation: Quaternion,
+    pub shape_rotation: Rot,
 
     /// The global rotation of the shape.
-    #[cfg(feature = "2d")]
-    global_shape_rotation: Scalar,
-
-    /// The global rotation of the shape.
-    #[cfg(feature = "3d")]
-    global_shape_rotation: Quaternion,
+    global_shape_rotation: Rot,
 
     /// The local direction of the shapecast relative to the [`Rotation`] of the shape caster entity or its parent.
     ///
@@ -114,7 +113,7 @@ pub struct ShapeCaster {
     ///
     /// By default, this is infinite.
     #[doc(alias = "max_time_of_impact")]
-    pub max_distance: Scalar,
+    pub max_distance: f32,
 
     /// The separation distance at which the shapes will be considered as impacting.
     ///
@@ -123,7 +122,7 @@ pub struct ShapeCaster {
     /// is set to `true`.
     ///
     /// By default, this is `0.0`, so the shapes will only be considered as impacting when they first touch.
-    pub target_distance: Scalar,
+    pub target_distance: f32,
 
     /// If `true`, contact points and normals will be calculated even when the cast distance is `0.0`.
     ///
@@ -151,20 +150,14 @@ impl Default for ShapeCaster {
             shape: Collider::circle(0.0),
             #[cfg(feature = "3d")]
             shape: Collider::sphere(0.0),
-            origin: Vector::ZERO,
-            global_origin: Vector::ZERO,
-            #[cfg(feature = "2d")]
-            shape_rotation: 0.0,
-            #[cfg(feature = "3d")]
-            shape_rotation: Quaternion::IDENTITY,
-            #[cfg(feature = "2d")]
-            global_shape_rotation: 0.0,
-            #[cfg(feature = "3d")]
-            global_shape_rotation: Quaternion::IDENTITY,
+            origin: RVector::ZERO,
+            global_origin: RVector::ZERO,
+            shape_rotation: Rot::IDENTITY,
+            global_shape_rotation: Rot::IDENTITY,
             direction: Dir::X,
             global_direction: Dir::X,
             max_hits: 1,
-            max_distance: Scalar::MAX,
+            max_distance: f32::MAX,
             target_distance: 0.0,
             compute_contact_on_penetration: true,
             ignore_origin_penetration: false,
@@ -176,40 +169,23 @@ impl Default for ShapeCaster {
 
 impl ShapeCaster {
     /// Creates a new [`ShapeCaster`] with a given shape, origin, shape rotation and direction.
-    #[cfg(feature = "2d")]
     pub fn new(
         shape: impl Into<Collider>,
-        origin: Vector,
-        shape_rotation: Scalar,
+        origin: RVector,
+        shape_rotation: impl Into<Rot>,
         direction: Dir,
     ) -> Self {
         Self {
             shape: shape.into(),
             origin,
-            shape_rotation,
-            direction,
-            ..default()
-        }
-    }
-    #[cfg(feature = "3d")]
-    /// Creates a new [`ShapeCaster`] with a given shape, origin, shape rotation and direction.
-    pub fn new(
-        shape: impl Into<Collider>,
-        origin: Vector,
-        shape_rotation: Quaternion,
-        direction: Dir,
-    ) -> Self {
-        Self {
-            shape: shape.into(),
-            origin,
-            shape_rotation,
+            shape_rotation: shape_rotation.into(),
             direction,
             ..default()
         }
     }
 
     /// Sets the ray origin.
-    pub fn with_origin(mut self, origin: Vector) -> Self {
+    pub fn with_origin(mut self, origin: RVector) -> Self {
         self.origin = origin;
         self
     }
@@ -227,7 +203,7 @@ impl ShapeCaster {
     /// is set to `true`.
     ///
     /// By default, this is `0.0`, so the shapes will only be considered as impacting when they first touch.
-    pub fn with_target_distance(mut self, target_distance: Scalar) -> Self {
+    pub fn with_target_distance(mut self, target_distance: f32) -> Self {
         self.target_distance = target_distance;
         self
     }
@@ -260,7 +236,7 @@ impl ShapeCaster {
     }
 
     /// Sets the maximum distance the shape can travel.
-    pub fn with_max_distance(mut self, max_distance: Scalar) -> Self {
+    pub fn with_max_distance(mut self, max_distance: f32) -> Self {
         self.max_distance = max_distance;
         self
     }
@@ -289,19 +265,12 @@ impl ShapeCaster {
     }
 
     /// Returns the global origin of the ray.
-    pub fn global_origin(&self) -> Vector {
+    pub fn global_origin(&self) -> RVector {
         self.global_origin
     }
 
     /// Returns the global rotation of the shape.
-    #[cfg(feature = "2d")]
-    pub fn global_shape_rotation(&self) -> Scalar {
-        self.global_shape_rotation
-    }
-
-    /// Returns the global rotation of the shape.
-    #[cfg(feature = "3d")]
-    pub fn global_shape_rotation(&self) -> Quaternion {
+    pub fn global_shape_rotation(&self) -> Rot {
         self.global_shape_rotation
     }
 
@@ -311,20 +280,13 @@ impl ShapeCaster {
     }
 
     /// Sets the global origin of the ray.
-    pub(crate) fn set_global_origin(&mut self, global_origin: Vector) {
+    pub(crate) fn set_global_origin(&mut self, global_origin: RVector) {
         self.global_origin = global_origin;
     }
 
     /// Sets the global rotation of the shape.
-    #[cfg(feature = "2d")]
-    pub(crate) fn set_global_shape_rotation(&mut self, global_rotation: Scalar) {
-        self.global_shape_rotation = global_rotation;
-    }
-
-    /// Sets the global rotation of the shape.
-    #[cfg(feature = "3d")]
-    pub(crate) fn set_global_shape_rotation(&mut self, global_rotation: Quaternion) {
-        self.global_shape_rotation = global_rotation;
+    pub(crate) fn set_global_shape_rotation(&mut self, global_rotation: impl Into<Rot>) {
+        self.global_shape_rotation = global_rotation.into();
     }
 
     /// Sets the global direction of the ray.
@@ -333,68 +295,49 @@ impl ShapeCaster {
     }
 
     pub(crate) fn cast(
-        &self,
+        &mut self,
         caster_entity: Entity,
         hits: &mut ShapeHits,
-        query_pipeline: &SpatialQueryPipeline,
+        spatial_query: &SpatialQuery,
     ) {
-        // TODO: This clone is here so that the excluded entities in the original `query_filter` aren't modified.
-        //       We could remove this if shapecasting could compute multiple hits without just doing casts in a loop.
-        //       See https://github.com/Jondolf/avian/issues/403.
-        let mut query_filter = self.query_filter.clone();
-
         if self.ignore_self {
-            query_filter.excluded_entities.insert(caster_entity);
+            self.query_filter.excluded_entities.insert(caster_entity);
+        } else {
+            self.query_filter.excluded_entities.remove(&caster_entity);
         }
 
         hits.clear();
 
-        let shape_rotation: Rotation;
-        #[cfg(feature = "2d")]
-        {
-            shape_rotation = Rotation::radians(self.global_shape_rotation());
-        }
-        #[cfg(feature = "3d")]
-        {
-            shape_rotation = Rotation::from(self.global_shape_rotation());
-        }
+        let config = ShapeCastConfig {
+            max_distance: self.max_distance,
+            target_distance: self.target_distance,
+            compute_contact_on_penetration: self.compute_contact_on_penetration,
+            ignore_origin_penetration: self.ignore_origin_penetration,
+        };
 
-        let shape_isometry = make_isometry(self.global_origin(), shape_rotation);
-        let shape_direction = self.global_direction().adjust_precision().into();
-
-        while hits.len() < self.max_hits as usize {
-            let pipeline_shape = query_pipeline.as_composite_shape(&query_filter);
-            let mut visitor = TOICompositeShapeShapeBestFirstVisitor::new(
-                &*query_pipeline.dispatcher,
-                &shape_isometry,
-                &shape_direction,
-                &pipeline_shape,
-                &**self.shape.shape_scaled(),
-                ShapeCastOptions {
-                    max_time_of_impact: self.max_distance,
-                    stop_at_penetration: !self.ignore_origin_penetration,
-                    ..default()
-                },
+        if self.max_hits == 1 {
+            let first_hit = spatial_query.cast_shape(
+                &self.shape,
+                self.global_origin,
+                self.global_shape_rotation,
+                self.global_direction,
+                &config,
+                &self.query_filter,
             );
 
-            if let Some(hit) =
-                query_pipeline
-                    .qbvh
-                    .traverse_best_first(&mut visitor)
-                    .map(|(_, (index, hit))| ShapeHitData {
-                        entity: query_pipeline.proxies[index as usize].entity,
-                        distance: hit.time_of_impact,
-                        point1: hit.witness1.into(),
-                        point2: hit.witness2.into(),
-                        normal1: hit.normal1.into(),
-                        normal2: hit.normal2.into(),
-                    })
-            {
+            if let Some(hit) = first_hit {
                 hits.push(hit);
-                query_filter.excluded_entities.insert(hit.entity);
-            } else {
-                return;
             }
+        } else {
+            hits.extend(spatial_query.shape_hits(
+                &self.shape,
+                self.global_origin,
+                self.global_shape_rotation,
+                self.global_direction,
+                self.max_hits,
+                &config,
+                &self.query_filter,
+            ));
         }
     }
 }
@@ -421,7 +364,7 @@ pub struct ShapeCastConfig {
     ///
     /// By default, this is infinite.
     #[doc(alias = "max_time_of_impact")]
-    pub max_distance: Scalar,
+    pub max_distance: f32,
 
     /// The separation distance at which the shapes will be considered as impacting.
     ///
@@ -430,7 +373,7 @@ pub struct ShapeCastConfig {
     /// is set to `true`.
     ///
     /// By default, this is `0.0`, so the shapes will only be considered as impacting when they first touch.
-    pub target_distance: Scalar,
+    pub target_distance: f32,
 
     /// If `true`, contact points and normals will be calculated even when the cast distance is `0.0`.
     ///
@@ -453,7 +396,7 @@ impl Default for ShapeCastConfig {
 impl ShapeCastConfig {
     /// The default [`ShapeCastConfig`] configuration.
     pub const DEFAULT: Self = Self {
-        max_distance: Scalar::MAX,
+        max_distance: f32::MAX,
         target_distance: 0.0,
         compute_contact_on_penetration: true,
         ignore_origin_penetration: false,
@@ -461,7 +404,7 @@ impl ShapeCastConfig {
 
     /// Creates a new [`ShapeCastConfig`] with a given maximum distance the shape can travel.
     #[inline]
-    pub const fn from_max_distance(max_distance: Scalar) -> Self {
+    pub const fn from_max_distance(max_distance: f32) -> Self {
         Self {
             max_distance,
             target_distance: 0.0,
@@ -473,9 +416,9 @@ impl ShapeCastConfig {
     /// Creates a new [`ShapeCastConfig`] with a given separation distance at which
     /// the shapes will be considered as impacting.
     #[inline]
-    pub const fn from_target_distance(target_distance: Scalar) -> Self {
+    pub const fn from_target_distance(target_distance: f32) -> Self {
         Self {
-            max_distance: Scalar::MAX,
+            max_distance: f32::MAX,
             target_distance,
             compute_contact_on_penetration: true,
             ignore_origin_penetration: false,
@@ -484,14 +427,14 @@ impl ShapeCastConfig {
 
     /// Sets the maximum distance the shape can travel.
     #[inline]
-    pub const fn with_max_distance(mut self, max_distance: Scalar) -> Self {
+    pub const fn with_max_distance(mut self, max_distance: f32) -> Self {
         self.max_distance = max_distance;
         self
     }
 
     /// Sets the separation distance at which the shapes will be considered as impacting.
     #[inline]
-    pub const fn with_target_distance(mut self, target_distance: Scalar) -> Self {
+    pub const fn with_target_distance(mut self, target_distance: f32) -> Self {
         self.target_distance = target_distance;
         self
     }
@@ -502,6 +445,16 @@ impl ShapeCastConfig {
 /// The maximum number of hits depends on the value of `max_hits` in [`ShapeCaster`]. By default only
 /// one hit is computed, as shapecasting for many results can be expensive.
 ///
+/// # Order
+///
+/// By default, the order of the hits is not guaranteed.
+///
+/// You can iterate the hits in the order of distance with `iter_sorted`.
+/// Note that this will create and sort a new vector instead of iterating over the existing one.
+///
+/// **Note**: When there are more hits than `max_hits`, **some hits will be missed**.
+/// If you want to guarantee that the closest hit is included, set `max_hits` to one.
+///
 /// # Example
 ///
 /// ```
@@ -511,7 +464,8 @@ impl ShapeCastConfig {
 ///
 /// fn print_hits(query: Query<&ShapeHits, With<ShapeCaster>>) {
 ///     for hits in &query {
-///         for hit in hits {
+///         // For the faster iterator that isn't sorted, use `.iter()`.
+///         for hit in hits.iter_sorted() {
 ///             println!("Hit entity {} with distance {}", hit.entity, hit.distance);
 ///         }
 ///     }
@@ -522,6 +476,17 @@ impl ShapeCastConfig {
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Component, Debug, Default, PartialEq)]
 pub struct ShapeHits(pub Vec<ShapeHitData>);
+
+impl ShapeHits {
+    /// Returns an iterator over the hits, sorted in ascending order according to the distance.
+    ///
+    /// Note that this allocates a new vector. If you don't need the hits in order, use `iter`.
+    pub fn iter_sorted(&self) -> alloc::vec::IntoIter<ShapeHitData> {
+        let mut vector = self.as_slice().to_vec();
+        vector.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        vector.into_iter()
+    }
+}
 
 impl IntoIterator for ShapeHits {
     type Item = ShapeHitData;
@@ -569,19 +534,19 @@ pub struct ShapeHitData {
 
     /// How far the shape travelled before the initial hit.
     #[doc(alias = "time_of_impact")]
-    pub distance: Scalar,
+    pub distance: f32,
 
     /// The closest point on the shape that was hit, expressed in world space.
     ///
     /// If the shapes are penetrating or the target distance is greater than zero,
     /// this will be different from `point2`.
-    pub point1: Vector,
+    pub point1: RVector,
 
     /// The closest point on the shape that was cast, expressed in world space.
     ///
     /// If the shapes are penetrating or the target distance is greater than zero,
     /// this will be different from `point1`.
-    pub point2: Vector,
+    pub point2: RVector,
 
     /// The outward surface normal on the hit shape at `point1`, expressed in world space.
     pub normal1: Vector,

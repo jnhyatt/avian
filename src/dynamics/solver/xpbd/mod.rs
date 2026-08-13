@@ -55,11 +55,11 @@
 //! ```
 #![cfg_attr(
     feature = "2d",
-    doc = "# use avian2d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::{Scalar, Vector}, prelude::*};"
+    doc = "# use avian2d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
 )]
 #![cfg_attr(
     feature = "3d",
-    doc = "# use avian3d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::{Scalar, Vector}, prelude::*};"
+    doc = "# use avian3d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
 )]
 //! # use bevy::{ecs::entity::{EntityMapper, MapEntities}, prelude::*};
 //! #
@@ -71,15 +71,24 @@
 //! // Store additional internal solver data for the constraint.
 //! struct CustomConstraintSolverData {
 //!     // Accumulated Lagrange multipliers for the `JointForces` component.
-//!     total_lagrange: Vector,
+#![cfg_attr(feature = "2d", doc = "    total_lagrange: Vec2,")]
+#![cfg_attr(feature = "3d", doc = "    total_lagrange: Vec3,")]
 //! }
 //!
 //! impl XpbdConstraintSolverData for CustomConstraintSolverData {
 //!     fn clear_lagrange_multipliers(&mut self) {
-//!         self.total_lagrange = Vector::ZERO;
+#![cfg_attr(feature = "2d", doc = "        self.total_lagrange = Vec2::ZERO;")]
+#![cfg_attr(feature = "3d", doc = "        self.total_lagrange = Vec3::ZERO;")]
 //!     }
 //!
-//!     fn total_position_lagrange(&self) -> Vector {
+#![cfg_attr(
+    feature = "2d",
+    doc = "    fn total_position_lagrange(&self) -> Vec2 {"
+)]
+#![cfg_attr(
+    feature = "3d",
+    doc = "    fn total_position_lagrange(&self) -> Vec3 {"
+)]
 //!         self.total_lagrange
 //!     }
 //! }
@@ -108,7 +117,7 @@
 //!         bodies: [&mut SolverBody; 2],
 //!         inertias: [&SolverBodyInertia; 2],
 //!         solver_data: &mut CustomConstraintSolverData,
-//!         dt: Scalar,
+//!         dt: f32,
 //!     ) {
 //!         // Solve the constraint by applying corrections to the `delta_position`
 //!         // and `delta_rotation` of the participating bodies.
@@ -131,29 +140,29 @@
 //! system that handles some of the background work for you.
 //!
 //! Add the `solve_xpbd_joint::<YourConstraint>` system to the [substepping schedule's](SubstepSchedule)
-//! [`XpbdSolverSet::SolveUserConstraints`] system set. It should look like this:
+//! [`XpbdSolverSystems::SolveUserConstraints`] system set. It should look like this:
 //!
 //! ```ignore
 //! // Prepare custom constraint
 //! app.add_systems(
 //!     PhysicsSchedule,
 //!     prepare_xpbd_joint::<CustomConstraint>
-//!         .in_set(SolverSet::PrepareJoints),
+//!         .in_set(SolverSystems::PrepareJoints),
 //! );
 //!
 //! // Solve custom constraint
 //! app.add_systems(
 //!     SubstepSchedule,
 //!     solve_xpbd_joint::<CustomConstraint>
-//!         .in_set(XpbdSolverSet::SolveUserConstraints),
+//!         .in_set(XpbdSolverSystems::SolveUserConstraints),
 //! );
 //!
 //! // Optional: Write back constraint forces to the `JointForces` component.
 //! app.add_systems(
 //!     PhysicsSchedule,
 //!     write_back_joint_forces::<CustomConstraint>
-//!         .in_set(SolverSet::Finalize)
-//!         .ambiguous_with(SolverSet::Finalize),
+//!         .in_set(SolverSystems::Finalize)
+//!         .ambiguous_with(SolverSystems::Finalize),
 //! );
 //! ```
 //!
@@ -161,11 +170,17 @@
 //! solved automatically according to the `solve` method!
 //!
 //! If the constraint is a [joint](crate::dynamics::joints), it is recommended to also add an instance
-//! of [`JointGraphPlugin`](crate::dynamics::solver::joint_graph::JointGraphPlugin) for the constraint type.
+//! of [`JointGraphPlugin`](crate::dynamics::joints::joint_graph::JointGraphPlugin) for the constraint type.
 //! This is required for sleeping and the `JointCollisionDisabled` component to work.
 //!
+//! The [`JointGraphPlugin`](crate::dynamics::joints::joint_graph::JointGraphPlugin) also inserts
+//! [`XpbdVelocityProjection`] on the bodies it connects. Only bodies with that component have their
+//! velocities updated from the position corrections applied by XPBD constraints, so if your constraint
+//! is *not* registered in the joint graph, insert [`XpbdVelocityProjection`] on the participating
+//! bodies yourself.
+//!
 //! You can find a working example of a custom constraint
-//! [here](https://github.com/Jondolf/avian/blob/main/crates/avian3d/examples/custom_constraint.rs).
+//! [here](https://github.com/avianphysics/avian/blob/main/crates/avian3d/examples/custom_constraint.rs).
 //!
 //! [`EntityConstraint`]: crate::dynamics::joints::EntityConstraint
 //!
@@ -279,7 +294,10 @@
 //! attachment position.
 
 mod plugin;
-pub use plugin::{XpbdSolverPlugin, XpbdSolverSet, prepare_xpbd_joint, solve_xpbd_joint};
+pub use plugin::{
+    XpbdSolverPlugin, XpbdSolverSystems, XpbdVelocityProjection, prepare_xpbd_joint,
+    solve_xpbd_joint, warm_start_xpbd_motors,
+};
 
 pub mod joints;
 
@@ -305,7 +323,12 @@ pub trait XpbdConstraintSolverData {
 
     /// Returns the total Lagrange multiplier update applied to satisfy the rotation constraint.
     fn total_rotation_lagrange(&self) -> AngularVector {
-        AngularVector::ZERO
+        AngularVector::default()
+    }
+
+    /// Returns the total Lagrange multiplier accumulated by the motor, if any.
+    fn total_motor_lagrange(&self) -> f32 {
+        0.0
     }
 }
 
@@ -338,14 +361,34 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
     /// computations and correction applying logic yourself.
     ///
     /// You can find a working example of a custom constraint
-    /// [here](https://github.com/Jondolf/avian/blob/main/crates/avian3d/examples/custom_constraint.rs).
+    /// [here](https://github.com/avianphysics/avian/blob/main/crates/avian3d/examples/custom_constraint.rs).
     fn solve(
         &mut self,
         bodies: [&mut SolverBody; ENTITY_COUNT],
         inertias: [&SolverBodyInertia; ENTITY_COUNT],
         solver_data: &mut Self::SolverData,
-        dt: Scalar,
+        dt: f32,
     );
+
+    /// Warm starts the motor constraints by applying impulses from the previous frame.
+    ///
+    /// This is called once at the beginning of the first substep. After applying,
+    /// the stored warm start impulses should be zeroed to prevent re-application
+    /// in subsequent substeps.
+    ///
+    /// The `warm_start_coefficient` scales the applied impulse (typically 1.0).
+    ///
+    /// The default implementation does nothing.
+    #[allow(unused_variables)]
+    fn warm_start_motors(
+        &self,
+        bodies: [&mut SolverBody; ENTITY_COUNT],
+        inertias: [&SolverBodyInertia; ENTITY_COUNT],
+        solver_data: &mut Self::SolverData,
+        dt: f32,
+        warm_start_coefficient: f32,
+    ) {
+    }
 }
 
 /// Computes how much a constraint's [Lagrange multiplier](self#lagrange-multipliers) changes when projecting
@@ -359,13 +402,13 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
 ///
 /// See the [constraint theory](#theory) for more information.
 pub fn compute_lagrange_update_with_gradients(
-    lagrange: Scalar,
-    c: Scalar,
+    lagrange: f32,
+    c: f32,
     gradients: &[Vector],
-    inverse_masses: &[Scalar],
-    compliance: Scalar,
-    dt: Scalar,
-) -> Scalar {
+    inverse_masses: &[f32],
+    compliance: f32,
+    dt: f32,
+) -> f32 {
     // Compute the sum of all inverse masses multiplied by the squared lengths of the corresponding gradients.
     let w_sum = inverse_masses
         .iter()
@@ -373,7 +416,7 @@ pub fn compute_lagrange_update_with_gradients(
         .fold(0.0, |acc, (i, w)| acc + *w * gradients[i].length_squared());
 
     // Avoid division by zero
-    if w_sum <= Scalar::EPSILON {
+    if w_sum <= f32::EPSILON {
         return 0.0;
     }
 
@@ -391,18 +434,18 @@ pub fn compute_lagrange_update_with_gradients(
 ///
 /// See the [constraint theory](#theory) for more information.
 pub fn compute_lagrange_update(
-    lagrange: Scalar,
-    c: Scalar,
-    inverse_masses: &[Scalar],
-    compliance: Scalar,
-    dt: Scalar,
-) -> Scalar {
+    lagrange: f32,
+    c: f32,
+    inverse_masses: &[f32],
+    compliance: f32,
+    dt: f32,
+) -> f32 {
     // Compute the sum of all inverse masses.
     // The gradients are unit length, so they don't need to be considered.
-    let w_sum: Scalar = inverse_masses.iter().copied().sum();
+    let w_sum: f32 = inverse_masses.iter().copied().sum();
 
     // Avoid division by zero
-    if w_sum <= Scalar::EPSILON {
+    if w_sum <= f32::EPSILON {
         return 0.0;
     }
 

@@ -8,7 +8,7 @@
 
 use core::f32::consts::PI;
 
-use avian3d::{math::Vector, prelude::*};
+use avian3d::prelude::*;
 use bevy::{color::palettes::tailwind::*, picking::pointer::PointerInteraction, prelude::*};
 
 fn main() {
@@ -85,7 +85,7 @@ fn setup_scene(
                 MeshMaterial3d(white_matl.clone()),
                 RigidBody::Kinematic,
                 collider,
-                AngularVelocity(Vector::new(0.0, 0.5, 0.0)),
+                AngularVelocity(Vec3::new(0.0, 0.5, 0.0)),
                 Transform::from_xyz(
                     -SHAPES_X_EXTENT / 2. + i as f32 / (num_shapes - 1) as f32 * SHAPES_X_EXTENT,
                     2.0,
@@ -96,8 +96,8 @@ fn setup_scene(
             ))
             .observe(update_material_on::<Pointer<Over>>(hover_matl.clone()))
             .observe(update_material_on::<Pointer<Out>>(white_matl.clone()))
-            .observe(update_material_on::<Pointer<Pressed>>(pressed_matl.clone()))
-            .observe(update_material_on::<Pointer<Released>>(hover_matl.clone()))
+            .observe(update_material_on::<Pointer<Press>>(pressed_matl.clone()))
+            .observe(update_material_on::<Pointer<Release>>(hover_matl.clone()))
             .observe(rotate_on_drag);
     }
 
@@ -113,7 +113,7 @@ fn setup_scene(
     // Light
     commands.spawn((
         PointLight {
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             intensity: 10_000_000.,
             range: 100.0,
             shadow_depth_bias: 0.2,
@@ -141,14 +141,14 @@ fn setup_scene(
 }
 
 /// Returns an observer that updates the entity's material to the one specified.
-fn update_material_on<E>(
+fn update_material_on<E: EntityEvent>(
     new_material: Handle<StandardMaterial>,
-) -> impl Fn(Trigger<E>, Query<&mut MeshMaterial3d<StandardMaterial>>) {
+) -> impl Fn(On<E>, Query<&mut MeshMaterial3d<StandardMaterial>>) {
     // An observer closure that captures `new_material`. We do this to avoid needing to write four
     // versions of this observer, each triggered by a different event and with a different hardcoded
     // material. Instead, the event type is a generic, and the material is passed in.
     move |trigger, mut query| {
-        if let Ok(mut material) = query.get_mut(trigger.target()) {
+        if let Ok(mut material) = query.get_mut(trigger.event_target()) {
             material.0 = new_material.clone();
         }
     }
@@ -167,8 +167,8 @@ fn draw_pointer_intersections(pointers: Query<&PointerInteraction>, mut gizmos: 
 }
 
 /// An observer to rotate an entity when it is dragged.
-fn rotate_on_drag(drag: Trigger<Pointer<Drag>>, mut transforms: Query<&mut Transform>) {
-    let mut transform = transforms.get_mut(drag.target()).unwrap();
+fn rotate_on_drag(drag: On<Pointer<Drag>>, mut transforms: Query<&mut Transform>) {
+    let mut transform = transforms.get_mut(drag.entity).unwrap();
     transform.rotate_y(drag.delta.x * 0.02);
     transform.rotate_x(drag.delta.y * 0.02);
 }

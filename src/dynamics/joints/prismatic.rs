@@ -1,5 +1,5 @@
 use crate::{
-    dynamics::joints::{EntityConstraint, JointSet},
+    dynamics::joints::{EntityConstraint, JointSystems, motor::LinearMotor},
     prelude::*,
 };
 use bevy::{
@@ -16,9 +16,13 @@ use bevy::{
 /// This can be useful for things like elevators, pistons, sliding doors and moving platforms.
 ///
 /// Each prismatic joint is defined by a [`JointFrame`] on each body, a [`slider_axis`](Self::slider_axis)
-/// along which the bodies can translate, and an optional [`DistanceLimit`] that defines the extents of the allowed translation.
+/// along which the bodies can translate, and an optional [`DistanceLimit`] that defines the extents
+/// of the allowed translation.
 ///
 #[doc = include_str!("./images/prismatic_joint.svg")]
+///
+/// The joint can also include a [`LinearMotor`] for driving the translation along the [`slider_axis`](Self::slider_axis).
+/// Use this to create pistons, elevators, or other linear motion mechanisms.
 #[derive(Component, Clone, Debug, PartialEq, Reflect)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
@@ -42,11 +46,13 @@ pub struct PrismaticJoint {
     /// The extents of the allowed relative translation along the [`slider_axis`](Self::slider_axis).
     pub limits: Option<DistanceLimit>,
     /// The compliance used for aligning the positions of the bodies to the [`slider_axis`](Self::slider_axis) (inverse of stiffness, m / N).
-    pub align_compliance: Scalar,
+    pub align_compliance: f32,
     /// The compliance of the angular constraint (inverse of stiffness, N * m / rad).
-    pub angle_compliance: Scalar,
+    pub angle_compliance: f32,
     /// The compliance of the distance limit (inverse of stiffness, m / N).
-    pub limit_compliance: Scalar,
+    pub limit_compliance: f32,
+    /// A motor for driving the joint.
+    pub motor: LinearMotor,
 }
 
 impl EntityConstraint<2> for PrismaticJoint {
@@ -72,6 +78,7 @@ impl PrismaticJoint {
             align_compliance: 0.0,
             angle_compliance: 0.0,
             limit_compliance: 0.0,
+            motor: LinearMotor::new_disabled(MotorModel::DEFAULT),
         }
     }
 
@@ -113,7 +120,7 @@ impl PrismaticJoint {
     ///
     /// This configures the [`JointAnchor`] of each [`JointFrame`].
     #[inline]
-    pub const fn with_anchor(mut self, anchor: Vector) -> Self {
+    pub const fn with_anchor(mut self, anchor: RVector) -> Self {
         self.frame1.anchor = JointAnchor::FromGlobal(anchor);
         self.frame2.anchor = JointAnchor::FromGlobal(anchor);
         self
@@ -268,7 +275,7 @@ impl PrismaticJoint {
 
     /// Sets the translational limits along the [`slider_axis`](Self::slider_axis).
     #[inline]
-    pub const fn with_limits(mut self, min: Scalar, max: Scalar) -> Self {
+    pub const fn with_limits(mut self, min: f32, max: f32) -> Self {
         self.limits = Some(DistanceLimit::new(min, max));
         self
     }
@@ -279,7 +286,7 @@ impl PrismaticJoint {
         since = "0.4.0",
         note = "Use `with_align_compliance`, `with_limit_compliance`, and `with_angle_compliance` instead."
     )]
-    pub const fn with_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_compliance(mut self, compliance: f32) -> Self {
         self.align_compliance = compliance;
         self.angle_compliance = compliance;
         self.limit_compliance = compliance;
@@ -288,22 +295,29 @@ impl PrismaticJoint {
 
     /// Sets the compliance of the axis alignment constraint (inverse of stiffness, m / N).
     #[inline]
-    pub const fn with_align_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_align_compliance(mut self, compliance: f32) -> Self {
         self.align_compliance = compliance;
         self
     }
 
     /// Sets the compliance of the angular constraint (inverse of stiffness, N * m / rad).
     #[inline]
-    pub const fn with_angle_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_angle_compliance(mut self, compliance: f32) -> Self {
         self.angle_compliance = compliance;
         self
     }
 
     /// Sets the compliance of the distance limit (inverse of stiffness, m / N).
     #[inline]
-    pub const fn with_limit_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_limit_compliance(mut self, compliance: f32) -> Self {
         self.limit_compliance = compliance;
+        self
+    }
+
+    /// Sets the motor for the joint.
+    #[inline]
+    pub const fn with_motor(mut self, motor: LinearMotor) -> Self {
+        self.motor = motor;
         self
     }
 }
@@ -316,10 +330,9 @@ impl MapEntities for PrismaticJoint {
 }
 
 pub(super) fn plugin(app: &mut App) {
-    app.register_type::<PrismaticJoint>();
     app.add_systems(
         PhysicsSchedule,
-        update_local_frames.in_set(JointSet::PrepareLocalFrames),
+        update_local_frames.in_set(JointSystems::PrepareLocalFrames),
     );
 }
 
@@ -341,7 +354,7 @@ fn update_local_frames(
         };
 
         let [frame1, frame2] =
-            JointFrame::compute_local(joint.frame1, joint.frame2, pos1.0, pos2.0, rot1, rot2);
+            JointFrame::compute_local(joint.frame1, joint.frame2, pos1.0, pos2.0, *rot1, *rot2);
         joint.frame1 = frame1;
         joint.frame2 = frame2;
     }
@@ -353,7 +366,7 @@ impl DebugRenderConstraint<2> for PrismaticJoint {
 
     fn debug_render(
         &self,
-        positions: [Vector; 2],
+        positions: [RVector; 2],
         rotations: [Rotation; 2],
         _context: &mut Self::Context,
         gizmos: &mut Gizmos<PhysicsGizmos>,
@@ -369,8 +382,8 @@ impl DebugRenderConstraint<2> for PrismaticJoint {
             return;
         };
 
-        let anchor1 = pos1 + rot1 * local_anchor1;
-        let anchor2 = pos2 + rot2 * local_anchor2;
+        let anchor1 = pos1 + (rot1 * local_anchor1).real();
+        let anchor2 = pos2 + (rot2 * local_anchor2).real();
 
         if let Some(anchor_color) = config.joint_anchor_color {
             gizmos.draw_line(pos1, anchor1, anchor_color);

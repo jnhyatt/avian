@@ -8,7 +8,7 @@ pub use plugin::ColliderHierarchyPlugin;
 use crate::prelude::*;
 use bevy::{
     ecs::{
-        component::HookContext,
+        lifecycle::HookContext,
         relationship::{Relationship, RelationshipHookMode, RelationshipSourceCollection},
         world::DeferredWorld,
     },
@@ -45,7 +45,7 @@ use bevy::{
 ///
 /// [`Relationship`]: bevy::ecs::relationship::Relationship
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
-#[component(immutable, on_insert = <ColliderOf as Relationship>::on_insert, on_replace = <ColliderOf as Relationship>::on_replace)]
+#[component(immutable, on_insert = <ColliderOf as Relationship>::on_insert, on_discard = <ColliderOf as Relationship>::on_discard)]
 #[require(ColliderTransform)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
@@ -68,6 +68,8 @@ impl FromWorld for ColliderOf {
 // so we implement the relationship manually to work around this limitation.
 impl Relationship for ColliderOf {
     type RelationshipTarget = RigidBodyColliders;
+
+    const ALLOW_SELF_REFERENTIAL: bool = true;
 
     fn get(&self) -> Entity {
         self.body
@@ -145,7 +147,7 @@ impl Relationship for ColliderOf {
         }
     }
 
-    fn on_replace(
+    fn on_discard(
         mut world: DeferredWorld,
         HookContext {
             entity,
@@ -173,25 +175,23 @@ impl Relationship for ColliderOf {
                 relationship_target.collection_mut_risky(),
                 entity,
             );
-            if relationship_target.is_empty()
-                && let Ok(mut entity) = world.commands().get_entity(body)
-            {
-                // this "remove" operation must check emptiness because in the event that an identical
-                // relationship is inserted on top, this despawn would result in the removal of that identical
-                // relationship ... not what we want!
-                entity.queue_handled(
-                    |mut entity: EntityWorldMut| {
-                        if entity
-                            .get::<Self::RelationshipTarget>()
-                            .is_some_and(RelationshipTarget::is_empty)
-                        {
-                            entity.remove::<Self::RelationshipTarget>();
-                        }
-                    },
-                    |_, _| {},
-                );
+            if relationship_target.is_empty() {
+                let command = |mut entity: EntityWorldMut| {
+                    if entity
+                        .get::<Self::RelationshipTarget>()
+                        .is_some_and(RelationshipTarget::is_empty)
+                    {
+                        entity.remove::<Self::RelationshipTarget>();
+                    }
+                };
+
+                world.commands().queue_silenced(command.with_entity(body));
             }
         }
+    }
+
+    fn set_risky(&mut self, entity: Entity) {
+        self.body = entity;
     }
 }
 

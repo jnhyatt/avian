@@ -1,9 +1,11 @@
 use crate::{
     dynamics::{
-        integrator::{self, IntegrationSet, VelocityIntegrationData},
+        integrator::{
+            self, CustomVelocityIntegration, IntegrationSystems, VelocityIntegrationData,
+        },
         solver::{
             SolverDiagnostics,
-            solver_body::{SolverBody, SolverBodyInertia},
+            solver_body::{SolverBodies, SolverBodyIndex},
         },
     },
     prelude::*,
@@ -19,33 +21,20 @@ pub struct ForcePlugin;
 
 impl Plugin for ForcePlugin {
     fn build(&self, app: &mut App) {
-        // Register types.
-        app.register_type::<(
-            ConstantForce,
-            ConstantTorque,
-            ConstantLinearAcceleration,
-            ConstantAngularAcceleration,
-            ConstantLocalForce,
-            ConstantLocalLinearAcceleration,
-            AccumulatedLocalAcceleration,
-        )>();
-        #[cfg(feature = "3d")]
-        app.register_type::<(ConstantLocalTorque, ConstantLocalAngularAcceleration)>();
-
         // Set up system sets.
         app.configure_sets(
             PhysicsSchedule,
             (
-                ForceSet::ApplyConstantForces
-                    .in_set(IntegrationSet::UpdateVelocityIncrements)
+                ForceSystems::ApplyConstantForces
+                    .in_set(IntegrationSystems::UpdateVelocityIncrements)
                     .before(integrator::pre_process_velocity_increments),
-                ForceSet::Clear.in_set(SolverSet::PostSubstep),
+                ForceSystems::Clear.in_set(SolverSystems::PostSubstep),
             ),
         );
         app.configure_sets(
             SubstepSchedule,
-            ForceSet::ApplyLocalAcceleration
-                .in_set(IntegrationSet::Velocity)
+            ForceSystems::ApplyLocalAcceleration
+                .in_set(IntegrationSystems::Velocity)
                 .before(integrator::integrate_velocities),
         );
 
@@ -65,27 +54,27 @@ impl Plugin for ForcePlugin {
                 apply_constant_local_angular_acceleration,
             )
                 .chain()
-                .in_set(ForceSet::ApplyConstantForces),
+                .in_set(ForceSystems::ApplyConstantForces),
         );
 
         // Apply local forces and accelerations.
         // This is done in the substepping loop, because the orientations of bodies can change between substeps.
         app.add_systems(
             SubstepSchedule,
-            apply_local_acceleration.in_set(ForceSet::ApplyLocalAcceleration),
+            apply_local_acceleration.in_set(ForceSystems::ApplyLocalAcceleration),
         );
 
         // Clear accumulated forces and accelerations.
         app.add_systems(
             PhysicsSchedule,
-            clear_accumulated_local_acceleration.in_set(ForceSet::Clear),
+            clear_accumulated_local_acceleration.in_set(ForceSystems::Clear),
         );
     }
 }
 
 /// System sets for managing and applying forces, torques, and accelerations for [rigid bodies](RigidBody).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ForceSet {
+pub enum ForceSystems {
     /// Adds [`ConstantForce`], [`ConstantTorque`], [`ConstantLinearAcceleration`], and [`ConstantAngularAcceleration`]
     #[cfg_attr(
         feature = "2d",
@@ -116,15 +105,19 @@ fn apply_constant_forces(
 
 /// Applies [`ConstantTorque`] to the accumulated torques.
 fn apply_constant_torques(
+    solver_bodies: Res<SolverBodies>,
     mut bodies: Query<(
+        &SolverBodyIndex,
         &mut VelocityIntegrationData,
-        &SolverBodyInertia,
         &ConstantTorque,
     )>,
 ) {
     bodies
         .iter_mut()
-        .for_each(|(mut integration, inertia, constant_torque)| {
+        .for_each(|(index, mut integration, constant_torque)| {
+            let Some(inertia) = solver_bodies.get_inertia(*index) else {
+                return;
+            };
             integration.angular_increment +=
                 inertia.effective_inv_angular_inertia() * constant_torque.0;
         })
@@ -214,46 +207,56 @@ fn apply_constant_local_angular_acceleration(
 
 /// Applies [`AccumulatedLocalAcceleration`] to the linear and angular velocity of bodies.
 ///
-/// This should run in the substepping loop, just before [`IntegrationSet::Velocity`].
+/// This should run in the substepping loop, just before [`IntegrationSystems::Velocity`].
 fn apply_local_acceleration(
-    mut bodies: Query<(&mut SolverBody, &AccumulatedLocalAcceleration, &Rotation)>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    bodies: Query<
+        (&SolverBodyIndex, &AccumulatedLocalAcceleration, &Rotation),
+        Without<CustomVelocityIntegration>,
+    >,
     mut diagnostics: ResMut<SolverDiagnostics>,
     time: Res<Time<Substeps>>,
 ) {
     let start = crate::utils::Instant::now();
 
-    let delta_secs = time.delta_secs_f64() as Scalar;
+    let delta_secs = time.delta_secs();
 
-    bodies
-        .iter_mut()
-        .for_each(|(mut body, acceleration, rotation)| {
-            let rotation = body.delta_rotation * *rotation;
-            let locked_axes = body.flags.locked_axes();
+    let access = solver_bodies.access();
 
-            // Compute the world space velocity increments with locked axes applied.
-            let world_linear_acceleration =
-                locked_axes.apply_to_vec(rotation * acceleration.linear);
-            #[cfg(feature = "3d")]
-            let world_angular_acceleration =
-                locked_axes.apply_to_vec(rotation * acceleration.angular);
+    bodies.iter().for_each(|(index, acceleration, rotation)| {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
 
-            // Apply acceleration.
-            body.linear_velocity += world_linear_acceleration * delta_secs;
-            #[cfg(feature = "3d")]
-            {
-                body.angular_velocity += world_angular_acceleration * delta_secs;
-            }
-        });
+        let rotation = body.delta_rotation * Rot::from(*rotation);
+        let locked_axes = body.flags.locked_axes();
+
+        // Compute the world space velocity increments with locked axes applied.
+        let world_linear_acceleration = locked_axes.apply_to_vec(rotation * acceleration.linear);
+        #[cfg(feature = "3d")]
+        let world_angular_acceleration = locked_axes.apply_to_vec(rotation * acceleration.angular);
+
+        // Apply acceleration.
+        body.linear_velocity += world_linear_acceleration * delta_secs;
+        #[cfg(feature = "3d")]
+        {
+            body.angular_velocity += world_angular_acceleration * delta_secs;
+        }
+    });
 
     diagnostics.integrate_velocities += start.elapsed();
 }
 
-fn clear_accumulated_local_acceleration(mut query: Query<&mut AccumulatedLocalAcceleration>) {
-    query.iter_mut().for_each(|mut acceleration| {
+fn clear_accumulated_local_acceleration(
+    mut query: Query<&mut AccumulatedLocalAcceleration, Changed<AccumulatedLocalAcceleration>>,
+) {
+    for mut acceleration in &mut query {
+        // Change detection is bypassed here so that clearing does not mark the component
+        // as changed, which would cause the system to run again the next step.
+        let acceleration = acceleration.bypass_change_detection();
         acceleration.linear = Vector::ZERO;
         #[cfg(feature = "3d")]
         {
-            acceleration.angular = Vector::ZERO;
+            acceleration.angular = AngularVector::ZERO;
         }
-    });
+    }
 }

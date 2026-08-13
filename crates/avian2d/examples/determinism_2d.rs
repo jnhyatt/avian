@@ -14,13 +14,17 @@
 //! This test is based on the `FallingHinges` test in the Box2D physics engine:
 //! <https://github.com/erincatto/box2d/blob/90c2781f64775085035655661d5fe6542bf0fbd5/samples/sample_determinism.cpp>
 
+#![allow(clippy::type_complexity)]
+
+use core::f32::consts::PI;
+
 use avian2d::{
-    math::{AdjustPrecision, PI, Scalar, Vector},
+    math::{RVec2, Real},
     prelude::*,
 };
 use bevy::{
-    color::palettes::tailwind::CYAN_400, input::common_conditions::input_just_pressed, prelude::*,
-    render::camera::ScalingMode,
+    camera::ScalingMode, color::palettes::tailwind::CYAN_400,
+    input::common_conditions::input_just_pressed, prelude::*,
 };
 use bytemuck::{Pod, Zeroable};
 
@@ -35,7 +39,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             PhysicsPlugins::default().with_length_unit(0.5),
-            PhysicsDebugPlugin::default(),
+            PhysicsDebugPlugin,
         ))
         .init_resource::<Step>()
         .add_systems(Startup, (setup_scene, setup_ui))
@@ -123,8 +127,8 @@ fn setup_scene(
                     RevoluteJoint::new(prev_entity.unwrap(), entity)
                         .with_angle_limits(-0.1 * PI, 0.2 * PI)
                         .with_point_compliance(0.0001)
-                        .with_local_anchor1(Vec2::splat(half_size).adjust_precision())
-                        .with_local_anchor2(Vec2::new(offset, -half_size).adjust_precision()),
+                        .with_local_anchor1(Vec2::splat(half_size))
+                        .with_local_anchor2(Vec2::new(offset, -half_size)),
                     JointCollisionDisabled,
                 ));
                 prev_entity = None;
@@ -141,7 +145,7 @@ struct HashText;
 
 fn setup_ui(mut commands: Commands) {
     let font = TextFont {
-        font_size: 20.0,
+        font_size: FontSize::Px(20.0),
         ..default()
     };
 
@@ -205,8 +209,8 @@ fn clear_scene(
 #[derive(Pod, Zeroable, Clone, Copy)]
 #[repr(C)]
 struct Isometry {
-    translation: Vector,
-    rotation: Scalar,
+    translation: RVec2,
+    rotation: Real,
 }
 
 fn update_hash(
@@ -226,7 +230,7 @@ fn update_hash(
     for (position, rotation) in &transforms {
         let isometry = Isometry {
             translation: position.0,
-            rotation: rotation.as_radians(),
+            rotation: rotation.as_radians() as Real,
         };
         hash = djb2_hash(hash, bytemuck::bytes_of(&isometry));
     }

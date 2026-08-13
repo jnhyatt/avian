@@ -10,23 +10,12 @@
 //! The character controller logic is contained within the `plugin` module.
 //!
 //! For a dynamic character controller, see the `dynamic_character_2d` example.
-//!
-//! # Warning
-//!
-//! Note that this is *not* intended to be a fully featured character controller,
-//! and the collision logic is quite basic.
-//!
-//! For a better solution, consider implementing a "collide-and-slide" algorithm,
-//! or use an existing third party character controller plugin like Bevy Tnua
-//! (a dynamic character controller).
 
+#[expect(clippy::type_complexity)]
 mod plugin;
 
-use avian2d::{math::*, prelude::*};
-use bevy::{
-    prelude::*,
-    render::{render_asset::RenderAssetUsages, render_resource::PrimitiveTopology},
-};
+use avian2d::prelude::*;
+use bevy::{asset::RenderAssetUsages, prelude::*, render::render_resource::PrimitiveTopology};
 use examples_common_2d::ExampleCommonPlugin;
 use plugin::*;
 
@@ -41,7 +30,7 @@ fn main() {
             CharacterControllerPlugin,
         ))
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.1)))
-        .insert_resource(Gravity(Vector::NEG_Y * 1000.0))
+        .insert_resource(Gravity(Vec2::NEG_Y * 1000.0))
         .add_systems(Startup, setup)
         .run();
 }
@@ -53,11 +42,19 @@ fn setup(
 ) {
     // Player
     commands.spawn((
+        CharacterController,
+        CharacterMovementSettings::default(),
+        CharacterCollisions::default(),
+        GroundDetection {
+            // Use a slightly smaller capsule for shape casts used for ground detection
+            cast_shape: Some(Collider::capsule(12.49, 20.0)),
+            ..default()
+        },
+        Collider::capsule(12.5, 20.0),
         Mesh2d(meshes.add(Capsule2d::new(12.5, 20.0))),
         MeshMaterial2d(materials.add(Color::srgb(0.2, 0.7, 0.9))),
         Transform::from_xyz(0.0, -100.0, 0.0),
-        CharacterControllerBundle::new(Collider::capsule(12.5, 20.0), Vector::NEG_Y * 1500.0)
-            .with_movement(1250.0, 5.0, 400.0, (30.0 as Scalar).to_radians()),
+        TransformInterpolation,
     ));
 
     // A cube to move around
@@ -70,6 +67,7 @@ fn setup(
         Transform::from_xyz(50.0, -100.0, 0.0),
         RigidBody::Dynamic,
         Collider::rectangle(30.0, 30.0),
+        TransformInterpolation,
     ));
 
     // Platforms
@@ -137,9 +135,9 @@ fn setup(
     );
 
     let ramp_collider = Collider::triangle(
-        Vector::new(-125.0, 80.0),
-        Vector::NEG_X * 125.0,
-        Vector::X * 125.0,
+        Vec2::new(-125.0, 80.0),
+        Vec2::NEG_X * 125.0,
+        Vec2::X * 125.0,
     );
 
     commands.spawn((
@@ -161,9 +159,9 @@ fn setup(
     );
 
     let ramp_collider = Collider::triangle(
-        Vector::new(20.0, -40.0),
-        Vector::new(20.0, 40.0),
-        Vector::new(-20.0, -40.0),
+        Vec2::new(20.0, -40.0),
+        Vec2::new(20.0, 40.0),
+        Vec2::new(-20.0, -40.0),
     );
 
     commands.spawn((

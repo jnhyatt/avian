@@ -7,7 +7,7 @@ pub use plugin::*;
 
 pub mod constraint_graph;
 pub mod contact;
-pub mod joint_graph;
+pub mod islands;
 pub mod schedule;
 pub mod softness_parameters;
 pub mod solver_body;
@@ -18,7 +18,7 @@ mod diagnostics;
 pub use diagnostics::SolverDiagnostics;
 
 use crate::{
-    dynamics::solver::{joint_graph::JointGraphPlugin, solver_body::SolverBodyPlugin},
+    dynamics::{joints::joint_graph::JointGraphPlugin, solver::solver_body::SolverBodyPlugin},
     prelude::*,
 };
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -35,15 +35,16 @@ use bevy::{app::PluginGroupBuilder, prelude::*};
 /// | [`SolverBodyPlugin`]              | Manages [solver bodies](dynamics::solver::solver_body::SolverBody).                                                                                        |
 /// | [`IntegratorPlugin`]              | Handles motion caused by velocity, and applies external forces and gravity.                                                                                |
 /// | [`SolverPlugin`]                  | Manages and solves contacts, [joints](dynamics::joints), and other constraints.                                                                            |
-/// | [`CcdPlugin`]                     | Performs sweep-based [Continuous Collision Detection](dynamics::ccd) for bodies with the [`SweptCcd`] component.                                           |
-/// | [`SleepingPlugin`]                | Manages sleeping and waking for bodies, automatically deactivating them to save computational resources.                                                   |
-/// | [`JointGraphPlugin`]              | Manages the [`JointGraph`](joint_graph::JointGraph) for each joint type.                                                                                                            |
+/// | [`CcdPlugin`]                     | Performs [Continuous Collision Detection (CCD)](dynamics::ccd) for fast dynamic bodies.                                                                    |
+/// | [`IslandPlugin`]                  | Manages [simulation islands](dynamics::solver::islands) for sleeping and waking.                                                                           |
+/// | [`IslandSleepingPlugin`]          | Manages sleeping and waking of [simulation islands](dynamics::solver::islands).                                                                            |
+/// | [`JointGraphPlugin`]              | Manages the [`JointGraph`] for each joint type.                                                          |
 /// | [`XpbdSolverPlugin`]              | Solves joints using Extended Position-Based Dynamics (XPBD). Requires the `xpbd_joints` feature.                                                           |
 ///
 /// Refer to the documentation of the plugins for more information about their responsibilities and implementations.
 #[derive(Debug, Default)]
 pub struct SolverPlugins {
-    length_unit: Scalar,
+    length_unit: f32,
 }
 
 impl SolverPlugins {
@@ -51,7 +52,7 @@ impl SolverPlugins {
     ///
     /// The length unit will be used for initializing the [`PhysicsLengthUnit`]
     /// resource unless it already exists.
-    pub fn new_with_length_unit(unit: Scalar) -> Self {
+    pub fn new_with_length_unit(unit: f32) -> Self {
         Self { length_unit: unit }
     }
 }
@@ -64,7 +65,8 @@ impl PluginGroup for SolverPlugins {
             .add(IntegratorPlugin::default())
             .add(SolverPlugin::new_with_length_unit(self.length_unit))
             .add(CcdPlugin)
-            .add(SleepingPlugin)
+            .add(IslandPlugin)
+            .add(IslandSleepingPlugin)
             .add(JointGraphPlugin::<FixedJoint>::default())
             .add(JointGraphPlugin::<RevoluteJoint>::default())
             .add(JointGraphPlugin::<PrismaticJoint>::default())

@@ -3,14 +3,18 @@
 //!
 //! See [`IntegratorPlugin`].
 
-use crate::prelude::*;
+use crate::{
+    dynamics::solver::solver_body::SolverBodyFlags,
+    prelude::*,
+    utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach, par_for_each},
+};
 use bevy::{
     ecs::{intern::Interned, query::QueryData, schedule::ScheduleLabel},
     prelude::*,
 };
 use dynamics::solver::SolverDiagnostics;
 
-use super::solver::solver_body::SolverBody;
+use super::solver::solver_body::{SolverBodies, SolverBody, SolverBodyIndex};
 
 /// Integrates Newton's 2nd law of motion, applying forces and moving entities according to their velocities.
 ///
@@ -20,7 +24,7 @@ use super::solver::solver_body::SolverBody;
 /// Currently, only the [semi-implicit (symplectic) Euler](https://en.wikipedia.org/wiki/Semi-implicit_Euler_method)
 /// integration scheme is supported. It is the standard for game physics, being stable, efficient, and sufficiently accurate.
 ///
-/// See [`IntegrationSet`] for the system sets used by this plugin.
+/// See [`IntegrationSystems`] for the system sets used by this plugin.
 pub struct IntegratorPlugin {
     schedule: Interned<dyn ScheduleLabel>,
 }
@@ -44,34 +48,35 @@ impl Default for IntegratorPlugin {
 
 impl Plugin for IntegratorPlugin {
     fn build(&self, app: &mut App) {
-        // Add `VelocityIntegrationData` to all `SolverBody`s.
-        app.register_required_components::<SolverBody, VelocityIntegrationData>();
+        // Add `VelocityIntegrationData` to all bodies that have a solver body.
+        app.register_required_components::<SolverBodyIndex, VelocityIntegrationData>();
 
         app.init_resource::<Gravity>();
 
         app.configure_sets(
             PhysicsSchedule,
             (
-                IntegrationSet::UpdateVelocityIncrements
-                    .in_set(SolverSet::PreSubstep)
-                    .before(IntegrationSet::Velocity),
-                IntegrationSet::ClearVelocityIncrements
-                    .in_set(SolverSet::PostSubstep)
-                    .after(IntegrationSet::Velocity),
+                IntegrationSystems::UpdateVelocityIncrements
+                    .in_set(SolverSystems::PreSubstep)
+                    .before(IntegrationSystems::Velocity),
+                IntegrationSystems::ClearVelocityIncrements
+                    .in_set(SolverSystems::PostSubstep)
+                    .after(IntegrationSystems::Velocity),
             ),
         );
 
         app.add_systems(
             PhysicsSchedule,
             (
-                pre_process_velocity_increments.in_set(IntegrationSet::UpdateVelocityIncrements),
-                clear_velocity_increments.in_set(IntegrationSet::ClearVelocityIncrements),
+                pre_process_velocity_increments
+                    .in_set(IntegrationSystems::UpdateVelocityIncrements),
+                clear_velocity_increments.in_set(IntegrationSystems::ClearVelocityIncrements),
             ),
         );
 
         app.configure_sets(
             self.schedule.intern(),
-            (IntegrationSet::Velocity, IntegrationSet::Position).chain(),
+            (IntegrationSystems::Velocity, IntegrationSystems::Position).chain(),
         );
 
         app.add_systems(
@@ -79,8 +84,8 @@ impl Plugin for IntegratorPlugin {
             (
                 (integrate_velocities, clamp_velocities)
                     .chain()
-                    .in_set(IntegrationSet::Velocity),
-                integrate_positions.in_set(IntegrationSet::Position),
+                    .in_set(IntegrationSystems::Velocity),
+                integrate_positions.in_set(IntegrationSystems::Position),
             ),
         );
     }
@@ -89,25 +94,29 @@ impl Plugin for IntegratorPlugin {
 /// System sets for position and velocity integration,
 /// applying forces and moving bodies based on velocity.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IntegrationSet {
+pub enum IntegrationSystems {
     /// Applies gravity and locked axes to the linear and angular velocity increments of bodies,
     /// and multiplies them by the substep delta time to get the final per-substep increments.
     ///
-    /// Runs in the [`PhysicsSchedule`], in [`SolverSet::PreSubstep`].
+    /// Runs in the [`PhysicsSchedule`], in [`SolverSystems::PreSubstep`].
     UpdateVelocityIncrements,
     /// Applies velocity increments to the linear and angular velocities of bodies.
     ///
-    /// Typically runs in the [`SubstepSchedule`], in [`IntegrationSet::Velocity`].
+    /// Typically runs in the [`SubstepSchedule`], in [`IntegrationSystems::Velocity`].
     Velocity,
     /// Moves bodies based on their current velocities and the physics time step.
     ///
-    /// Typically runs in the [`SubstepSchedule`], in [`IntegrationSet::Position`].
+    /// Typically runs in the [`SubstepSchedule`], in [`IntegrationSystems::Position`].
     Position,
     /// Clears the velocity increments of bodies after the substepping loop.
     ///
-    /// Runs in the [`PhysicsSchedule`], in [`SolverSet::PostSubstep`].
+    /// Runs in the [`PhysicsSchedule`], in [`SolverSystems::PostSubstep`].
     ClearVelocityIncrements,
 }
+
+/// A deprecated alias for [`IntegrationSystems`].
+#[deprecated(since = "0.4.0", note = "Renamed to `IntegrationSystems`")]
+pub type IntegrationSet = IntegrationSystems;
 
 /// A resource for the global gravitational acceleration.
 ///
@@ -125,22 +134,19 @@ pub enum IntegrationSet {
 #[cfg_attr(feature = "3d", doc = "use avian3d::prelude::*;")]
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(feature = "f32")]
 /// fn main() {
 ///     App::new()
 ///         .add_plugins((DefaultPlugins, PhysicsPlugins::default()))
 #[cfg_attr(
     feature = "2d",
-    doc = "         .insert_resource(Gravity(Vec2::NEG_Y * 100.0))"
+    doc = "        .insert_resource(Gravity(Vec2::NEG_Y * 100.0))"
 )]
 #[cfg_attr(
     feature = "3d",
-    doc = "         .insert_resource(Gravity(Vec3::NEG_Y * 19.6))"
+    doc = "        .insert_resource(Gravity(Vec3::NEG_Y * 19.6))"
 )]
 ///         .run();
 /// }
-/// # #[cfg(not(feature = "f32"))]
-/// # fn main() {} // Doc test needs main
 /// ```
 ///
 /// You can also modify gravity while the app is running.
@@ -160,6 +166,34 @@ impl Gravity {
     /// Zero gravity.
     pub const ZERO: Gravity = Gravity(Vector::ZERO);
 }
+
+/// A marker component for bodies that use custom velocity integration.
+///
+/// This means that gravity, damping, and external forces will not be applied automatically.
+/// You are responsible for applying all forces and updating velocities manually.
+///
+/// Exceptions include:
+///
+/// - Contact impulses and joint impulses for dynamic bodies
+/// - Impulses applied via [`Forces`]
+#[derive(Component, Debug, Default, Reflect)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
+#[reflect(Component, Debug, Default)]
+pub struct CustomVelocityIntegration;
+
+/// A marker component for bodies that use custom position integration.
+///
+/// This means that the body's position and rotation will not be updated automatically
+/// based on velocity. You are responsible for updating the position and rotation manually.
+///
+/// This can be useful for implementing kinematic bodies that are moved according to custom logic,
+/// such as with [`MoveAndSlide`].
+#[derive(Component, Debug, Default, Reflect)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
+#[reflect(Component, Debug, Default)]
+pub struct CustomPositionIntegration;
 
 /// Pre-computed data for speeding up velocity integration.
 ///
@@ -183,20 +217,20 @@ impl Gravity {
 pub struct VelocityIntegrationData {
     /// The linear velocity increment to be applied to the body at each substep.
     ///
-    /// **Note:** This is treated as linear acceleration until [`IntegrationSet::UpdateVelocityIncrements`].
+    /// **Note:** This is treated as linear acceleration until [`IntegrationSystems::UpdateVelocityIncrements`].
     /// where it is multiplied by the time step to get the corresponding velocity increment.
     pub linear_increment: Vector,
     /// The angular velocity increment to be applied to the body at each substep.
     ///
-    /// **Note:** This is treated as angular acceleration until [`IntegrationSet::UpdateVelocityIncrements`].
+    /// **Note:** This is treated as angular acceleration until [`IntegrationSystems::UpdateVelocityIncrements`].
     /// where it is multiplied by the time step to get the corresponding velocity increment.
     pub angular_increment: AngularVector,
     /// The right-hand side of the linear damping equation,
     /// `1 / (1 + dt * c)`, where `c` is the damping coefficient.
-    pub linear_damping_rhs: Scalar,
+    pub linear_damping_rhs: f32,
     /// The right-hand side of the angular damping equation,
     /// `1 / (1 + dt * c)`, where `c` is the damping coefficient.
-    pub angular_damping_rhs: Scalar,
+    pub angular_damping_rhs: f32,
 }
 
 impl VelocityIntegrationData {
@@ -212,13 +246,13 @@ impl VelocityIntegrationData {
 
     /// Updates the cached right-hand side of the linear damping equation,
     /// `1 / (1 + dt * c)`, where `c` is the damping coefficient.
-    pub fn update_linear_damping_rhs(&mut self, damping_coefficient: Scalar, delta_secs: Scalar) {
+    pub fn update_linear_damping_rhs(&mut self, damping_coefficient: f32, delta_secs: f32) {
         self.linear_damping_rhs = 1.0 / (1.0 + delta_secs * damping_coefficient);
     }
 
     /// Updates the cached right-hand side of the angular damping equation,
     /// `1 / (1 + dt * c)`, where `c` is the damping coefficient.
-    pub fn update_angular_damping_rhs(&mut self, damping_coefficient: Scalar, delta_secs: Scalar) {
+    pub fn update_angular_damping_rhs(&mut self, damping_coefficient: f32, delta_secs: f32) {
         self.angular_damping_rhs = 1.0 / (1.0 + delta_secs * damping_coefficient);
     }
 }
@@ -239,10 +273,11 @@ pub fn pre_process_velocity_increments(
 ) {
     let start = crate::utils::Instant::now();
 
-    let delta_secs = time.delta_secs_f64() as Scalar;
+    let delta_secs = time.delta_secs();
 
     // TODO: Do we want to skip kinematic bodies here?
-    bodies.par_iter_mut().for_each(
+    bodies.par_for_each_mut(
+        MIN_PAR_ITER_ENTITIES,
         |(rb, mut integration, lin_damping, ang_damping, gravity_scale, locked_axes)| {
             if !rb.is_dynamic() {
                 // Skip non-dynamic bodies.
@@ -281,14 +316,14 @@ pub fn pre_process_velocity_increments(
 
 /// Clears the velocity increments of bodies after the substepping loop.
 fn clear_velocity_increments(
-    mut bodies: Query<&mut VelocityIntegrationData, With<SolverBody>>,
+    mut bodies: Query<&mut VelocityIntegrationData, With<SolverBodyIndex>>,
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
 
-    bodies.par_iter_mut().for_each(|mut integration| {
+    bodies.par_for_each_mut(MIN_PAR_ITER_ENTITIES, |mut integration| {
         integration.linear_increment = Vector::ZERO;
-        integration.angular_increment = AngularVector::ZERO;
+        integration.angular_increment = default();
     });
 
     diagnostics.update_velocity_increments += start.elapsed();
@@ -298,7 +333,7 @@ fn clear_velocity_increments(
 #[query_data(mutable)]
 #[doc(hidden)]
 pub struct VelocityIntegrationQuery {
-    solver_body: &'static mut SolverBody,
+    index: &'static SolverBodyIndex,
     integration: &'static mut VelocityIntegrationData,
     #[cfg(feature = "3d")]
     angular_inertia: &'static ComputedAngularInertia,
@@ -308,41 +343,50 @@ pub struct VelocityIntegrationQuery {
 
 /// Integrates the velocities of bodies by applying velocity increments and damping.
 pub fn integrate_velocities(
-    mut bodies: Query<VelocityIntegrationQuery, RigidBodyActiveFilter>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    mut bodies: Query<
+        VelocityIntegrationQuery,
+        (RigidBodyActiveFilter, Without<CustomVelocityIntegration>),
+    >,
     mut diagnostics: ResMut<SolverDiagnostics>,
     #[cfg(feature = "3d")] time: Res<Time>,
 ) {
     let start = crate::utils::Instant::now();
 
     #[cfg(feature = "3d")]
-    let delta_secs = time.delta_secs_f64() as Scalar;
+    let delta_secs = time.delta_secs();
 
-    bodies.par_iter_mut().for_each(|mut body| {
-        if body.solver_body.flags.is_kinematic() {
+    let access = solver_bodies.access();
+
+    bodies.par_for_each_mut(MIN_PAR_ITER_ENTITIES, |body| {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let solver_body = unsafe { access.body_unchecked_mut(*body.index) };
+
+        if solver_body.flags.is_kinematic() {
             // Skip kinematic bodies.
             return;
         }
 
         // Apply velocity damping.
-        body.solver_body.linear_velocity *= body.integration.linear_damping_rhs;
-        body.solver_body.angular_velocity *= body.integration.angular_damping_rhs;
+        solver_body.linear_velocity *= body.integration.linear_damping_rhs;
+        solver_body.angular_velocity *= body.integration.angular_damping_rhs;
 
         // Apply velocity increments.
-        body.solver_body.linear_velocity += body.integration.linear_increment;
-        body.solver_body.angular_velocity += body.integration.angular_increment;
+        solver_body.linear_velocity += body.integration.linear_increment;
+        solver_body.angular_velocity += body.integration.angular_increment;
 
         #[cfg(feature = "3d")]
         {
-            if body.solver_body.is_gyroscopic() {
+            if solver_body.is_gyroscopic() {
                 // TODO: Should this be opt-in with a `GyroscopicMotion` component?
                 // TODO: It's a bit unfortunate that this has to run in the substepping loop
                 //       rather than pre-computing the velocity increments once per time step.
                 //       This needs to be done because the gyroscopic torque relies on up-to-date rotations
                 //       and world-space angular inertia tensors. Omitting the change in orientation would
                 //       lead to worse accuracy and angular momentum not being conserved.
-                let rotation = body.solver_body.delta_rotation.0 * body.rotation.0;
+                let rotation = solver_body.delta_rotation * Rot::from(*body.rotation);
                 solve_gyroscopic_torque(
-                    &mut body.solver_body.angular_velocity,
+                    &mut solver_body.angular_velocity,
                     rotation,
                     body.angular_inertia,
                     delta_secs,
@@ -366,9 +410,9 @@ pub fn integrate_velocities(
 #[inline]
 pub fn solve_gyroscopic_torque(
     ang_vel: &mut Vector,
-    rotation: Quaternion,
+    rotation: Quat,
     local_inertia: &ComputedAngularInertia,
-    delta_secs: Scalar,
+    delta_secs: f32,
 ) {
     // References:
     // - The "Gyroscopic Motion" section of Erin Catto's GDC 2015 slides on Numerical Methods.
@@ -429,16 +473,21 @@ pub fn solve_gyroscopic_torque(
 //       that only some bodies have clamped velocities.
 /// Clamps the velocities of bodies to [`MaxLinearSpeed`] and [`MaxAngularSpeed`].
 fn clamp_velocities(
+    mut solver_bodies: ResMut<SolverBodies>,
     mut bodies: ParamSet<(
-        Query<(&mut SolverBody, &MaxLinearSpeed)>,
-        Query<(&mut SolverBody, &MaxAngularSpeed)>,
+        Query<(&SolverBodyIndex, &MaxLinearSpeed)>,
+        Query<(&SolverBodyIndex, &MaxAngularSpeed)>,
     )>,
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
 
+    let access = solver_bodies.access();
+
     // Clamp linear velocity.
-    bodies.p0().iter_mut().for_each(|(mut body, max_speed)| {
+    bodies.p0().iter().for_each(|(index, max_speed)| {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
         let linear_speed_squared = body.linear_velocity.length_squared();
         if linear_speed_squared > max_speed.0 * max_speed.0 {
             body.linear_velocity *= max_speed.0 / linear_speed_squared.sqrt();
@@ -446,7 +495,9 @@ fn clamp_velocities(
     });
 
     // Clamp angular velocity.
-    bodies.p1().iter_mut().for_each(|(mut body, max_speed)| {
+    bodies.p1().iter().for_each(|(index, max_speed)| {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
         #[cfg(feature = "2d")]
         if body.angular_velocity.abs() > max_speed.0 {
             body.angular_velocity = max_speed.copysign(body.angular_velocity);
@@ -465,33 +516,41 @@ fn clamp_velocities(
 
 /// Integrates the positions of bodies based on their velocities and the time step.
 pub fn integrate_positions(
-    mut solver_bodies: Query<&mut SolverBody>,
+    mut bodies: ResMut<SolverBodies>,
     time: Res<Time>,
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
 
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
 
-    solver_bodies.par_iter_mut().for_each(|body| {
+    par_for_each(bodies.bodies_mut(), 4096, |_index, body| {
+        // Skip bodies that have custom position integration.
+        if body
+            .flags
+            .contains(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION)
+        {
+            return;
+        }
+
         let SolverBody {
             linear_velocity,
             angular_velocity,
             delta_position,
             delta_rotation,
             ..
-        } = body.into_inner();
+        } = body;
 
         *delta_position += *linear_velocity * delta_secs;
         #[cfg(feature = "2d")]
         {
             // Note: We should probably use `add_angle_fast` here
-            *delta_rotation = Rotation::radians(*angular_velocity * delta_secs) * *delta_rotation;
+            *delta_rotation = Rot2::radians(*angular_velocity * delta_secs) * *delta_rotation;
         }
         #[cfg(feature = "3d")]
         {
-            delta_rotation.0 =
-                Quaternion::from_scaled_axis(*angular_velocity * delta_secs) * delta_rotation.0;
+            *delta_rotation =
+                Quat::from_scaled_axis(*angular_velocity * delta_secs) * *delta_rotation;
         }
     });
 
@@ -505,7 +564,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     use crate::prelude::*;
-    use bevy::{prelude::*, render::mesh::MeshPlugin, time::TimeUpdateStrategy};
+    use bevy::{mesh::MeshPlugin, prelude::*, time::TimeUpdateStrategy};
 
     fn create_app() -> App {
         let mut app = App::new();
@@ -518,8 +577,7 @@ mod tests {
             #[cfg(feature = "bevy_scene")]
             bevy::scene::ScenePlugin,
             MeshPlugin,
-        ))
-        .init_resource::<Assets<Mesh>>();
+        ));
         app
     }
 
@@ -544,7 +602,7 @@ mod tests {
                 {
                     (
                         MassPropertiesBundle::from_shape(&Cuboid::from_length(1.0), 1.0),
-                        AngularVelocity(Vector::Z * 2.0),
+                        AngularVelocity(Vec3::Z * 2.0),
                     )
                 },
             ))
@@ -571,7 +629,7 @@ mod tests {
         let angular_velocity = entity_ref.get::<AngularVelocity>().unwrap().0;
 
         // Euler methods have some precision issues, but this seems weirdly inaccurate.
-        assert_relative_eq!(position, Vector::NEG_Y * 490.5, epsilon = 10.0);
+        assert_relative_eq!(position, RVector::NEG_Y * 490.5, epsilon = 10.0);
 
         #[cfg(feature = "2d")]
         assert_relative_eq!(
@@ -580,11 +638,7 @@ mod tests {
             epsilon = 0.00001
         );
         #[cfg(feature = "3d")]
-        assert_relative_eq!(
-            rotation.0,
-            Quaternion::from_rotation_z(20.0),
-            epsilon = 0.01
-        );
+        assert_relative_eq!(rotation.0, Quat::from_rotation_z(20.0), epsilon = 0.01);
 
         assert_relative_eq!(linear_velocity, Vector::NEG_Y * 98.1, epsilon = 0.0001);
         #[cfg(feature = "2d")]

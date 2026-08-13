@@ -40,17 +40,17 @@
 //! # #[cfg(feature = "2d")]
 //! # use avian2d::prelude::*;
 //! # #[cfg(feature = "3d")]
-//! use avian3d::prelude::*;
+//! use avian3d::{math::RVec3, prelude::*};
 //! use bevy::prelude::*;
 //!
-//! # #[cfg(all(feature = "3d", feature = "f32"))]
+//! # #[cfg(feature = "3d")]
 //! fn setup(mut commands: Commands) {
 //!     // Spawn a ray caster at the center with the rays travelling right
-//!     commands.spawn(RayCaster::new(Vec3::ZERO, Dir3::X));
+//!     commands.spawn(RayCaster::new(RVec3::ZERO, Dir3::X));
 //!     // ...spawn colliders and other things
 //! }
 //!
-//! # #[cfg(all(feature = "3d", feature = "f32"))]
+//! # #[cfg(feature = "3d")]
 //! fn print_hits(query: Query<(&RayCaster, &RayHits)>) {
 //!     for (ray, hits) in &query {
 //!         // For the faster iterator that isn't sorted, use `.iter()`
@@ -58,7 +58,7 @@
 //!             println!(
 //!                 "Hit entity {} at {} with normal {}",
 //!                 hit.entity,
-//!                 ray.origin + *ray.direction * hit.distance,
+//!                 ray.get_global_point(hit.distance),
 //!                 hit.normal,
 //!             );
 //!         }
@@ -95,15 +95,15 @@
 //! # #[cfg(feature = "2d")]
 //! # use avian2d::prelude::*;
 //! # #[cfg(feature = "3d")]
-//! use avian3d::prelude::*;
+//! use avian3d::{math::RVec3, prelude::*};
 //! use bevy::prelude::*;
 //!
-//! # #[cfg(all(feature = "3d", feature = "f32"))]
+//! # #[cfg(feature = "3d")]
 //! fn setup(mut commands: Commands) {
 //!     // Spawn a shape caster with a sphere shape at the center travelling right
 //!     commands.spawn(ShapeCaster::new(
 //!         Collider::sphere(0.5), // Shape
-//!         Vec3::ZERO,            // Origin
+//!         RVec3::ZERO,           // Origin
 //!         Quat::default(),       // Shape rotation
 //!         Dir3::X                // Direction
 //!     ));
@@ -150,8 +150,6 @@
 //!
 //! To specify which colliders should be considered in the query, use a [spatial query filter](`SpatialQueryFilter`).
 
-#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
-mod pipeline;
 mod query_filter;
 mod ray_caster;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
@@ -162,8 +160,6 @@ mod system_param;
 mod diagnostics;
 pub use diagnostics::SpatialQueryDiagnostics;
 
-#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
-pub use pipeline::*;
 pub use query_filter::*;
 pub use ray_caster::*;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
@@ -172,42 +168,53 @@ pub use shape_caster::*;
 pub use system_param::*;
 
 use crate::prelude::*;
-use bevy::prelude::*;
+use bevy::{
+    ecs::{intern::Interned, schedule::ScheduleLabel},
+    prelude::*,
+};
 
-/// Initializes the [`SpatialQueryPipeline`] resource and handles component-based [spatial queries](spatial_query)
-/// like [raycasting](spatial_query#raycasting) and [shapecasting](spatial_query#shapecasting) with
-/// [`RayCaster`] and [`ShapeCaster`].
-pub struct SpatialQueryPlugin;
+/// Handles component-based [spatial queries](spatial_query) like [raycasting](spatial_query#raycasting)
+/// and [shapecasting](spatial_query#shapecasting) with [`RayCaster`] and [`ShapeCaster`].
+pub struct SpatialQueryPlugin {
+    schedule: Interned<dyn ScheduleLabel>,
+}
+
+impl SpatialQueryPlugin {
+    /// Creates a [`SpatialQueryPlugin`] with the schedule that is used for running the [`PhysicsSchedule`].
+    ///
+    /// The default schedule is `FixedPostUpdate`.
+    pub fn new(schedule: impl ScheduleLabel) -> Self {
+        Self {
+            schedule: schedule.intern(),
+        }
+    }
+}
+
+impl Default for SpatialQueryPlugin {
+    fn default() -> Self {
+        Self::new(FixedPostUpdate)
+    }
+}
 
 impl Plugin for SpatialQueryPlugin {
     fn build(&self, app: &mut App) {
-        #[cfg(all(
-            feature = "default-collider",
-            any(feature = "parry-f32", feature = "parry-f64")
-        ))]
-        app.init_resource::<SpatialQueryPipeline>();
+        app.configure_sets(
+            self.schedule,
+            SpatialQuerySystems.after(TransformSystems::Propagate),
+        );
 
-        let physics_schedule = app
-            .get_schedule_mut(PhysicsSchedule)
-            .expect("add PhysicsSchedule first");
-
-        physics_schedule.add_systems(
+        app.add_systems(
+            self.schedule,
             (
                 update_ray_caster_positions,
                 #[cfg(all(
                     feature = "default-collider",
                     any(feature = "parry-f32", feature = "parry-f64")
                 ))]
-                (
-                    update_shape_caster_positions,
-                    update_spatial_query_pipeline,
-                    raycast,
-                    shapecast,
-                )
-                    .chain(),
+                (update_shape_caster_positions, raycast, shapecast).chain(),
             )
                 .chain()
-                .in_set(PhysicsStepSet::SpatialQuery),
+                .in_set(SpatialQuerySystems),
         );
     }
 
@@ -217,21 +224,11 @@ impl Plugin for SpatialQueryPlugin {
     }
 }
 
-/// Updates the [`SpatialQueryPipeline`].
-#[cfg(all(
-    feature = "default-collider",
-    any(feature = "parry-f32", feature = "parry-f64")
-))]
-pub fn update_spatial_query_pipeline(
-    mut spatial_query: SpatialQuery,
-    mut diagnostics: ResMut<SpatialQueryDiagnostics>,
-) {
-    let start = crate::utils::Instant::now();
-
-    spatial_query.update_pipeline();
-
-    diagnostics.update_pipeline = start.elapsed();
-}
+/// Responsible for updating spatial query components like [`RayCaster`] and [`ShapeCaster`].
+///
+/// See [`SpatialQueryPlugin`].
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SpatialQuerySystems;
 
 type RayCasterPositionQueryComponents = (
     &'static mut RayCaster,
@@ -261,7 +258,9 @@ fn update_ray_caster_positions(
         let global_rotation = rotation.copied().or(transform.map(Rotation::from));
 
         if let Some(global_position) = global_position {
-            ray.set_global_origin(global_position.0 + rotation.map_or(origin, |rot| rot * origin));
+            ray.set_global_origin(
+                global_position.0 + rotation.map_or(origin, |rot| rot.real() * origin),
+            );
         } else if parent.is_none() {
             ray.set_global_origin(origin);
         }
@@ -288,7 +287,7 @@ fn update_ray_caster_positions(
                 && let Some(position) = parent_position
             {
                 let rotation = global_rotation.unwrap_or(parent_rotation.unwrap_or_default());
-                ray.set_global_origin(position.0 + rotation * origin);
+                ray.set_global_origin(position.0 + rotation.real() * origin);
             }
             if global_rotation.is_none()
                 && let Some(rotation) = parent_rotation
@@ -331,23 +330,23 @@ fn update_shape_caster_positions(
         let global_rotation = rotation.copied().or(transform.map(Rotation::from));
 
         if let Some(global_position) = global_position {
-            shape_caster
-                .set_global_origin(global_position.0 + rotation.map_or(origin, |rot| rot * origin));
+            shape_caster.set_global_origin(
+                global_position.0 + rotation.map_or(origin, |rot| rot.real() * origin),
+            );
         } else if parent.is_none() {
             shape_caster.set_global_origin(origin);
         }
 
-        if let Some(global_rotation) = global_rotation {
+        if let Some(global_rotation) = global_rotation.map(Rot::from) {
             let global_direction = global_rotation * shape_caster.direction;
             shape_caster.set_global_direction(global_direction);
             #[cfg(feature = "2d")]
             {
-                shape_caster
-                    .set_global_shape_rotation(shape_rotation + global_rotation.as_radians());
+                shape_caster.set_global_shape_rotation(shape_rotation * global_rotation);
             }
             #[cfg(feature = "3d")]
             {
-                shape_caster.set_global_shape_rotation(shape_rotation * global_rotation.0);
+                shape_caster.set_global_shape_rotation(shape_rotation * global_rotation);
             }
         } else if parent.is_none() {
             shape_caster.set_global_direction(direction);
@@ -376,20 +375,20 @@ fn update_shape_caster_positions(
                 && let Some(position) = parent_position
             {
                 let rotation = global_rotation.unwrap_or(parent_rotation.unwrap_or_default());
-                shape_caster.set_global_origin(position.0 + rotation * origin);
+                shape_caster.set_global_origin(position.0 + rotation.real() * origin);
             }
             if global_rotation.is_none()
-                && let Some(rotation) = parent_rotation
+                && let Some(rotation) = parent_rotation.map(Rot::from)
             {
                 let global_direction = rotation * shape_caster.direction;
                 shape_caster.set_global_direction(global_direction);
                 #[cfg(feature = "2d")]
                 {
-                    shape_caster.set_global_shape_rotation(shape_rotation + rotation.as_radians());
+                    shape_caster.set_global_shape_rotation(shape_rotation * rotation);
                 }
                 #[cfg(feature = "3d")]
                 {
-                    shape_caster.set_global_shape_rotation(shape_rotation * rotation.0);
+                    shape_caster.set_global_shape_rotation(shape_rotation * rotation);
                 }
             }
         }
@@ -404,9 +403,9 @@ fn raycast(
 ) {
     let start = crate::utils::Instant::now();
 
-    for (entity, mut ray, mut hits) in &mut rays {
-        if ray.enabled {
-            ray.cast(entity, &mut hits, &spatial_query.query_pipeline);
+    for (entity, mut ray_caster, mut hits) in &mut rays {
+        if ray_caster.enabled {
+            ray_caster.cast(entity, &mut hits, &spatial_query);
         } else if !hits.is_empty() {
             hits.clear();
         }
@@ -417,15 +416,15 @@ fn raycast(
 
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 fn shapecast(
-    mut shape_casters: Query<(Entity, &ShapeCaster, &mut ShapeHits)>,
+    mut shape_casters: Query<(Entity, &mut ShapeCaster, &mut ShapeHits)>,
     spatial_query: SpatialQuery,
     mut diagnostics: ResMut<SpatialQueryDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
 
-    for (entity, shape_caster, mut hits) in &mut shape_casters {
+    for (entity, mut shape_caster, mut hits) in &mut shape_casters {
         if shape_caster.enabled {
-            shape_caster.cast(entity, &mut hits, &spatial_query.query_pipeline);
+            shape_caster.cast(entity, &mut hits, &spatial_query);
         } else if !hits.is_empty() {
             hits.clear();
         }

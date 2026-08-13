@@ -5,10 +5,10 @@
 
 use crate::prelude::*;
 use bevy::{
-    ecs::schedule::{ExecutorKind, LogLevel, ScheduleBuildSettings, ScheduleLabel},
+    ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel, SingleThreadedExecutor},
     prelude::*,
 };
-use dynamics::integrator::IntegrationSet;
+use dynamics::integrator::IntegrationSystems;
 
 /// Sets up the default scheduling, system set configuration, and time resources for the physics solver.
 #[derive(Debug, Default)]
@@ -16,8 +16,8 @@ pub struct SolverSchedulePlugin;
 
 impl Plugin for SolverSchedulePlugin {
     fn build(&self, app: &mut App) {
-        // Register types.
-        app.register_type::<(Time<Substeps>, SubstepCount)>();
+        // Register types with generics.
+        app.register_type::<Time<Substeps>>();
 
         // Initialize resources.
         app.insert_resource(Time::new_with(Substeps))
@@ -28,42 +28,43 @@ impl Plugin for SolverSchedulePlugin {
             .get_schedule_mut(PhysicsSchedule)
             .expect("add PhysicsSchedule first");
 
-        // See `SolverSet` for what each system set is responsible for.
+        // See `SolverSystems` for what each system set is responsible for.
         physics.configure_sets(
             (
-                SolverSet::PrepareSolverBodies,
-                SolverSet::PrepareJoints,
-                SolverSet::PrepareContactConstraints,
-                SolverSet::PreSubstep,
-                SolverSet::Substep,
-                SolverSet::PostSubstep,
-                SolverSet::Restitution,
-                SolverSet::Finalize,
-                SolverSet::StoreContactImpulses,
+                SolverSystems::PrepareSolverBodies,
+                SolverSystems::PrepareJoints,
+                SolverSystems::PrepareContactConstraints,
+                SolverSystems::PreSubstep,
+                SolverSystems::Substep,
+                SolverSystems::PostSubstep,
+                SolverSystems::Restitution,
+                SolverSystems::ContinuousCollision,
+                SolverSystems::Finalize,
+                SolverSystems::StoreContactImpulses,
             )
                 .chain()
-                .in_set(PhysicsStepSet::Solver),
+                .in_set(PhysicsStepSystems::Solver),
         );
 
         // Run the substepping loop.
-        physics.add_systems(run_substep_schedule.in_set(SolverSet::Substep));
+        physics.add_systems(run_substep_schedule.in_set(SolverSystems::Substep));
 
         // Set up the substep schedule, the schedule that runs systems in the inner substepping loop.
         app.edit_schedule(SubstepSchedule, |schedule| {
             schedule
-                .set_executor_kind(ExecutorKind::SingleThreaded)
+                .set_executor(SingleThreadedExecutor::new())
                 .set_build_settings(ScheduleBuildSettings {
                     ambiguity_detection: LogLevel::Error,
                     ..default()
                 })
                 .configure_sets(
                     (
-                        IntegrationSet::Velocity,
-                        SubstepSolverSet::WarmStart,
-                        SubstepSolverSet::SolveConstraints,
-                        IntegrationSet::Position,
-                        SubstepSolverSet::Relax,
-                        SubstepSolverSet::Damping,
+                        IntegrationSystems::Velocity,
+                        SubstepSolverSystems::WarmStart,
+                        SubstepSolverSystems::SolveConstraints,
+                        IntegrationSystems::Position,
+                        SubstepSolverSystems::Relax,
+                        SubstepSolverSystems::Damping,
                     )
                         .chain(),
                 );
@@ -71,7 +72,7 @@ impl Plugin for SolverSchedulePlugin {
     }
 }
 
-/// The substepping schedule that runs in [`SolverSet::Substep`].
+/// The substepping schedule that runs in [`SolverSystems::Substep`].
 /// The number of substeps per physics step is configured through the [`SubstepCount`] resource.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, ScheduleLabel)]
 pub struct SubstepSchedule;
@@ -82,15 +83,16 @@ pub struct SubstepSchedule;
 ///
 /// Below is the core solver loop.
 ///
-/// 1. Prepare solver bodies ([`SolverSet::PrepareSolverBodies`])
-/// 2. Prepare joints ([`SolverSet::PrepareJoints`])
-/// 3. Prepare contact constraints ([`SolverSet::PrepareContactConstraints`])
-/// 4. Substepping loop (runs the [`SubstepSchedule`] [`SubstepCount`] times; see [`SolverSet::Substep`])
-/// 5. Apply restitution ([`SolverSet::Restitution`])
-/// 6. Write back solver body data to rigid bodies. ([`SolverSet::Finalize`])
-/// 7. Store contact impulses for next frame's warm starting ([`SolverSet::StoreContactImpulses`])
+/// 1. Prepare solver bodies ([`SolverSystems::PrepareSolverBodies`])
+/// 2. Prepare joints ([`SolverSystems::PrepareJoints`])
+/// 3. Prepare contact constraints ([`SolverSystems::PrepareContactConstraints`])
+/// 4. Substepping loop (runs the [`SubstepSchedule`] [`SubstepCount`] times; see [`SolverSystems::Substep`])
+/// 5. Apply restitution ([`SolverSystems::Restitution`])
+/// 6. Perform Continuous Collision Detection (CCD) for fast dynamic bodies ([`SolverSystems::ContinuousCollision`])
+/// 7. Write back solver body data to rigid bodies. ([`SolverSystems::Finalize`])
+/// 8. Store contact impulses for next frame's warm starting ([`SolverSystems::StoreContactImpulses`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SolverSet {
+pub enum SolverSystems {
     /// Prepares [solver bodies] for the substepping loop.
     ///
     /// [solver bodies]: crate::dynamics::solver::solver_body::SolverBody
@@ -107,42 +109,52 @@ pub enum SolverSet {
     PostSubstep,
     /// Applies [restitution](Restitution) for bodies after solving overlap.
     Restitution,
+    /// Performs [Continuous Collision Detection (CCD)](dynamics::ccd) for fast dynamic bodies.
+    ContinuousCollision,
     /// Writes back solver body data to rigid bodies.
     Finalize,
     /// Copies contact impulses from [`ContactConstraints`] to the contacts in the [`ContactGraph`].
-    /// They will be used for [warm starting](SubstepSolverSet::WarmStart) the next frame or substep.
+    /// They will be used for [warm starting](SubstepSolverSystems::WarmStart) the next frame or substep.
     ///
     /// [`ContactConstraints`]: super::ContactConstraints
     StoreContactImpulses,
 }
 
+/// A deprecated alias for [`SolverSystems`].
+#[deprecated(since = "0.4.0", note = "Renamed to `SolverSystems`")]
+pub type SolverSet = SolverSystems;
+
 /// System sets for the substepped part of the constraint solver.
 ///
 /// # Steps
 ///
-/// 1. Integrate velocity ([`IntegrationSet::Velocity`])
-/// 2. Warm start ([`SubstepSolverSet::WarmStart`])
-/// 3. Solve constraints with bias ([`SubstepSolverSet::SolveConstraints`])
-/// 4. Integrate positions ([`IntegrationSet::Position`])
-/// 5. Solve constraints without bias to relax velocities ([`SubstepSolverSet::Relax`])
-/// 6. Apply velocity-based constraint damping ([`SubstepSolverSet::Damping`])
+/// 1. Integrate velocity ([`IntegrationSystems::Velocity`])
+/// 2. Warm start ([`SubstepSolverSystems::WarmStart`])
+/// 3. Solve constraints with bias ([`SubstepSolverSystems::SolveConstraints`])
+/// 4. Integrate positions ([`IntegrationSystems::Position`])
+/// 5. Solve constraints without bias to relax velocities ([`SubstepSolverSystems::Relax`])
+/// 6. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SubstepSolverSet {
+pub enum SubstepSolverSystems {
     /// Warm starts the solver by applying the impulses from the previous frame or substep.
     ///
     /// This significantly improves convergence, but by itself can lead to overshooting.
-    /// Overshooting is reduced by [relaxing](SubstepSolverSet::Relax) the biased velocities
+    /// Overshooting is reduced by [relaxing](SubstepSolverSystems::Relax) the biased velocities
     /// by running the solver a second time *without* bias.
     WarmStart,
     /// Solves velocity constraints using a position bias that boosts the response
     /// to account for the constraint error.
     SolveConstraints,
     /// Solves velocity constraints without a position bias to relax the biased velocities
-    /// and impulses. This reduces overshooting caused by [warm starting](SubstepSolverSet::WarmStart).
+    /// and impulses. This reduces overshooting caused by [warm starting](SubstepSolverSystems::WarmStart).
     Relax,
     /// Applies velocity-based constraint damping, such as [`JointDamping`].
     Damping,
 }
+
+/// A deprecated alias for [`SubstepSolverSystems`].
+#[deprecated(since = "0.4.0", note = "Renamed to `SubstepSolverSystems`")]
+pub type SubstepSolverSet = SubstepSolverSystems;
 
 /// The number of substeps used in the simulation.
 ///

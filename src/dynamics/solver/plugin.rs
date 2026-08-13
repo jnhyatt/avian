@@ -1,21 +1,31 @@
 use crate::{
     dynamics::{
-        joints::EntityConstraint,
+        joints::{
+            EntityConstraint,
+            joint_graph::{JointGraph, JointGraphChange},
+        },
         solver::{
             SolverDiagnostics,
             constraint_graph::{
                 COLOR_OVERFLOW_INDEX, ConstraintGraph, ContactManifoldHandle, GraphColor,
             },
             contact::ContactConstraint,
-            schedule::SubstepSolverSet,
+            islands::{BodyIslandNode, IslandId, PhysicsIslands, WakeIslands},
+            schedule::SubstepSolverSystems,
             softness_parameters::{SoftnessCoefficients, SoftnessParameters},
-            solver_body::{SolverBody, SolverBodyInertia},
+            solver_body::{
+                SolverBodies, SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
+            },
         },
     },
     prelude::*,
 };
 use bevy::{
-    ecs::{query::QueryData, system::lifetimeless::Read},
+    ecs::{
+        entity_disabling::Disabled,
+        query::QueryData,
+        system::{SystemState, lifetimeless::Read},
+    },
     prelude::*,
 };
 use core::cmp::Ordering;
@@ -50,23 +60,23 @@ use core::cmp::Ordering;
 ///
 /// Below are the main steps of the `SolverPlugin`.
 ///
-/// 1. [Prepare solver bodies](SolverSet::PrepareSolverBodies)
-/// 2. [Prepare joint constraints](SolverSet::PrepareJoints)
-/// 3. [Prepare contact constraints](SolverSet::PrepareContactConstraints)
+/// 1. [Prepare solver bodies](SolverSystems::PrepareSolverBodies)
+/// 2. [Prepare joint constraints](SolverSystems::PrepareJoints)
+/// 3. [Prepare contact constraints](SolverSystems::PrepareContactConstraints)
 /// 4. Substepping loop (runs the [`SubstepSchedule`] [`SubstepCount`] times)
-///     1. [Integrate velocities](crate::dynamics::integrator::IntegrationSet::Velocity)
-///     2. [Warm start](SubstepSolverSet::WarmStart)
-///     3. [Solve constraints with bias](SubstepSolverSet::SolveConstraints)
-///     4. [Integrate positions](crate::dynamics::integrator::IntegrationSet::Position)
-///     5. [Solve constraints without bias to relax velocities](SubstepSolverSet::Relax)
-/// 5. [Apply restitution](SolverSet::Restitution)
-/// 6. [Write back solver body data to rigid bodies](SolverSet::Finalize)
-/// 7. [Store contact impulses for next frame's warm starting](SolverSet::StoreContactImpulses)
+///     1. [Integrate velocities](crate::dynamics::integrator::IntegrationSystems::Velocity)
+///     2. [Warm start](SubstepSolverSystems::WarmStart)
+///     3. [Solve constraints with bias](SubstepSolverSystems::SolveConstraints)
+///     4. [Integrate positions](crate::dynamics::integrator::IntegrationSystems::Position)
+///     5. [Solve constraints without bias to relax velocities](SubstepSolverSystems::Relax)
+/// 5. [Apply restitution](SolverSystems::Restitution)
+/// 6. [Write back solver body data to rigid bodies](SolverSystems::Finalize)
+/// 7. [Store contact impulses for next frame's warm starting](SolverSystems::StoreContactImpulses)
 ///
 /// If the `xpbd_joints` feature is enabled, the [`XpbdSolverPlugin`] can also be added to solve joints
 /// using Extended Position-Based Dynamics (XPBD).
 pub struct SolverPlugin {
-    length_unit: Scalar,
+    length_unit: f32,
 }
 
 impl Default for SolverPlugin {
@@ -80,7 +90,7 @@ impl SolverPlugin {
     ///
     /// The length unit will be used for initializing the [`PhysicsLengthUnit`]
     /// resource unless it already exists.
-    pub fn new_with_length_unit(unit: Scalar) -> Self {
+    pub fn new_with_length_unit(unit: f32) -> Self {
         Self { length_unit: unit }
     }
 }
@@ -100,22 +110,42 @@ impl Plugin for SolverPlugin {
             app.insert_resource(PhysicsLengthUnit(self.length_unit));
         }
 
+        // Cache the system state used by the `FlushContactStatusChangeQueue` command.
+        let cached_state = CachedContactStatusChangeSystemState(SystemState::new(app.world_mut()));
+        app.insert_resource(cached_state);
+
         // Get the `PhysicsSchedule`, and panic if it doesn't exist.
         let physics = app
             .get_schedule_mut(PhysicsSchedule)
             .expect("add PhysicsSchedule first");
 
-        physics.add_systems(update_contact_softness.before(PhysicsStepSet::NarrowPhase));
+        physics.add_systems(update_contact_softness.before(PhysicsStepSystems::NarrowPhase));
+
+        // Apply queued contact status changes and joint graph changes
+        // to the constraint graph and islands.
+        //
+        // These are drained at two points each time step:
+        //
+        // - Before the broad phase (contacts only)
+        // - At the start of the solver
+        physics.add_systems(apply_contact_status_changes.in_set(PhysicsStepSystems::First));
+        physics.add_systems(
+            (apply_contact_status_changes, apply_joint_graph_changes)
+                .chain()
+                .in_set(PhysicsStepSystems::Solver)
+                .before(SolverSystems::PrepareSolverBodies),
+        );
 
         // Prepare contact constraints before the substepping loop.
-        physics
-            .add_systems(prepare_contact_constraints.in_set(SolverSet::PrepareContactConstraints));
+        physics.add_systems(
+            prepare_contact_constraints.in_set(SolverSystems::PrepareContactConstraints),
+        );
 
         // Apply restitution.
-        physics.add_systems(solve_restitution.in_set(SolverSet::Restitution));
+        physics.add_systems(solve_restitution.in_set(SolverSystems::Restitution));
 
         // Store the current contact impulses for the next frame's warm starting.
-        physics.add_systems(store_contact_impulses.in_set(SolverSet::StoreContactImpulses));
+        physics.add_systems(store_contact_impulses.in_set(SolverSystems::StoreContactImpulses));
 
         // Get the `SubstepSchedule`, and panic if it doesn't exist.
         let substeps = app
@@ -125,14 +155,14 @@ impl Plugin for SolverPlugin {
         // Warm start the impulses.
         // This applies the impulses stored from the previous substep,
         // which improves convergence.
-        substeps.add_systems(warm_start.in_set(SubstepSolverSet::WarmStart));
+        substeps.add_systems(warm_start.in_set(SubstepSolverSystems::WarmStart));
 
         // Solve velocities using a position bias.
-        substeps.add_systems(solve_contacts::<true>.in_set(SubstepSolverSet::SolveConstraints));
+        substeps.add_systems(solve_contacts::<true>.in_set(SubstepSolverSystems::SolveConstraints));
 
         // Relax biased velocities and impulses.
         // This reduces overshooting caused by warm starting.
-        substeps.add_systems(solve_contacts::<false>.in_set(SubstepSolverSet::Relax));
+        substeps.add_systems(solve_contacts::<false>.in_set(SubstepSolverSystems::Relax));
 
         // Perform constraint damping.
         substeps.add_systems(
@@ -145,13 +175,283 @@ impl Plugin for SolverPlugin {
                 joint_damping::<DistanceJoint>,
             )
                 .chain()
-                .in_set(SubstepSolverSet::Damping),
+                .in_set(SubstepSolverSystems::Damping),
         );
     }
 
     fn finish(&self, app: &mut App) {
         // Register timer and counter diagnostics for the solver.
         app.register_physics_diagnostics::<SolverDiagnostics>();
+    }
+}
+
+/// Applies the [`ContactStatusChange`]s to the [`ConstraintGraph`] and [`PhysicsIslands`].
+pub fn apply_contact_status_changes(
+    mut changes: ResMut<ContactStatusChangeQueue>,
+    contact_graph: Res<ContactGraph>,
+    mut constraint_graph: ResMut<ConstraintGraph>,
+    mut islands: Option<ResMut<PhysicsIslands>>,
+    mut body_islands: Query<&mut BodyIslandNode, Or<(With<Disabled>, Without<Disabled>)>>,
+    mut commands: Commands,
+) {
+    if changes.is_empty() {
+        return;
+    }
+
+    let mut islands_to_wake: Vec<IslandId> = Vec::new();
+
+    for change in changes.drain(..) {
+        apply_contact_status_change(
+            change,
+            &contact_graph,
+            &mut constraint_graph,
+            islands.as_deref_mut(),
+            &mut body_islands,
+            &mut islands_to_wake,
+        );
+    }
+
+    if !islands_to_wake.is_empty() {
+        islands_to_wake.sort_unstable();
+        islands_to_wake.dedup();
+
+        // Wake up the islands that were previously sleeping.
+        commands.queue(WakeIslands(islands_to_wake));
+    }
+}
+
+/// Applies [`JointGraphChange`] messages to [`PhysicsIslands`].
+pub fn apply_joint_graph_changes(
+    mut changes: MessageReader<JointGraphChange>,
+    joint_graph: Res<JointGraph>,
+    mut islands: Option<ResMut<PhysicsIslands>>,
+    mut body_islands: Query<&mut BodyIslandNode, Or<(With<Disabled>, Without<Disabled>)>>,
+    mut commands: Commands,
+) {
+    let Some(islands) = &mut islands else {
+        // Islands are not in use, so there is nothing to update.
+        changes.clear();
+        return;
+    };
+
+    let mut islands_to_wake: Vec<IslandId> = Vec::new();
+
+    for &change in changes.read() {
+        match change {
+            JointGraphChange::Added(joint_id) => {
+                // The joint may have already been removed before this change was applied.
+                if joint_graph.get_by_id(joint_id).is_none() {
+                    continue;
+                }
+
+                // Link the joint to an island.
+                if let Some(island) = islands.add_joint(joint_id, &mut body_islands, &joint_graph)
+                    && island.is_sleeping
+                {
+                    // Wake up the island if it was previously sleeping.
+                    islands_to_wake.push(island.id);
+                }
+            }
+            JointGraphChange::Removed(joint_id) => {
+                // The joint may never have been linked to an island.
+                if islands.joint_node(joint_id).is_none() {
+                    continue;
+                }
+
+                // Unlink the joint from its island.
+                if let Some(island) = islands.remove_joint(joint_id, &mut body_islands)
+                    && island.is_sleeping
+                {
+                    // Wake up the island if it was previously sleeping.
+                    islands_to_wake.push(island.id);
+                }
+            }
+        }
+    }
+
+    if !islands_to_wake.is_empty() {
+        islands_to_wake.sort_unstable();
+        islands_to_wake.dedup();
+
+        // Wake up the islands that were previously sleeping.
+        commands.queue(WakeIslands(islands_to_wake));
+    }
+}
+
+/// Applies a single [`ContactStatusChange`] to the [`ConstraintGraph`] and [`PhysicsIslands`].
+///
+/// Any islands that should be woken up are pushed to `islands_to_wake`.
+fn apply_contact_status_change(
+    change: ContactStatusChange,
+    contact_graph: &ContactGraph,
+    constraint_graph: &mut ConstraintGraph,
+    islands: Option<&mut PhysicsIslands>,
+    body_islands: &mut Query<&mut BodyIslandNode, Or<(With<Disabled>, Without<Disabled>)>>,
+    islands_to_wake: &mut Vec<IslandId>,
+) {
+    match change {
+        ContactStatusChange::StartedGeneratingConstraints(contact) => {
+            let Some((_, contact_pair)) = contact_graph.get_by_id(contact) else {
+                return;
+            };
+
+            // Add a contact constraint for each manifold.
+            for _ in 0..contact_pair.manifolds.len() {
+                constraint_graph.push_manifold(contact_pair);
+            }
+
+            // Link the contact to an island.
+            if let Some(islands) = islands {
+                let island = islands.add_contact(contact, body_islands, contact_graph);
+
+                if let Some(island) = island
+                    && island.is_sleeping
+                {
+                    // Wake up the island if it was previously sleeping.
+                    islands_to_wake.push(island.id);
+                }
+            }
+        }
+        ContactStatusChange::StoppedGeneratingConstraints {
+            contact_id: contact,
+            body1,
+            body2,
+        } => {
+            // Remove the contact's constraints.
+            constraint_graph.remove_contact(contact, body1, body2);
+
+            // Unlink the contact from its island.
+            if let Some(islands) = islands
+                && islands.contact_node(contact).is_some()
+            {
+                let island = islands.remove_contact(contact, body_islands);
+                let island_id = island.id;
+
+                // TODO: Do we need this?
+                if island.is_sleeping {
+                    // Wake up the island if it was previously sleeping.
+                    islands_to_wake.push(island_id);
+                }
+
+                // The island may now be empty. Clean it up.
+                islands.remove_island_if_empty(island_id);
+            }
+        }
+        ContactStatusChange::ManifoldCountChanged {
+            contact,
+            body1,
+            body2,
+            delta,
+        } => {
+            if delta > 0 {
+                // The manifold count increased. Add the new manifolds to the constraint graph.
+                let Some((_, contact_pair)) = contact_graph.get_by_id(contact) else {
+                    return;
+                };
+                for _ in 0..delta {
+                    constraint_graph.push_manifold(contact_pair);
+                }
+            } else {
+                // The manifold count decreased. Remove the excess manifolds.
+                for _ in 0..delta.unsigned_abs() {
+                    constraint_graph.pop_manifold(contact, body1, body2);
+                }
+            }
+        }
+    }
+}
+
+/// A cached [`SystemState`] for [`FlushContactStatusChangeQueue`].
+#[derive(Resource)]
+struct CachedContactStatusChangeSystemState(
+    SystemState<(
+        ResMut<'static, ContactStatusChangeQueue>,
+        Res<'static, ContactGraph>,
+        ResMut<'static, ConstraintGraph>,
+        Option<ResMut<'static, PhysicsIslands>>,
+        Query<
+            'static,
+            'static,
+            &'static mut BodyIslandNode,
+            Or<(With<Disabled>, Without<Disabled>)>,
+        >,
+    )>,
+);
+
+/// A [`Command`] that immediately applies all queued [`ContactStatusChange`]s to the
+/// [`ConstraintGraph`] and [`PhysicsIslands`], rather than waiting for the next physics step.
+///
+/// The narrow phase and the collider/body lifecycle observers record contact status changes into
+/// the [`ContactStatusChangeQueue`], which is normally drained during the physics step.
+/// Queuing this command forces those changes to be applied right away.
+///
+/// This can be useful if the constraint graph and islands need to be consistent immediately
+/// after despawning colliders or bodies outside of the physics schedule. In general however,
+/// it is best to let the physics step handle this automatically.
+///
+/// # Example
+///
+/// ```
+#[cfg_attr(
+    feature = "2d",
+    doc = "use avian2d::{dynamics::solver::FlushContactStatusChangeQueue, prelude::*};"
+)]
+#[cfg_attr(
+    feature = "3d",
+    doc = "use avian3d::{dynamics::solver::FlushContactStatusChangeQueue, prelude::*};"
+)]
+/// use bevy::prelude::*;
+///
+/// fn clear_scene(mut commands: Commands, bodies: Query<Entity, With<RigidBody>>) {
+///     for entity in &bodies {
+///         commands.entity(entity).despawn();
+///     }
+///
+///     // Apply the resulting constraint graph and island changes immediately.
+///     commands.queue(FlushContactStatusChangeQueue);
+/// }
+/// ```
+pub struct FlushContactStatusChangeQueue;
+
+impl Command for FlushContactStatusChangeQueue {
+    type Out = ();
+
+    fn apply(self, world: &mut World) {
+        // The cached system state may not exist if the `SolverPlugin` was not added.
+        world.try_resource_scope(
+            |world, mut state: Mut<CachedContactStatusChangeSystemState>| {
+                let mut islands_to_wake: Vec<IslandId> = Vec::new();
+
+                {
+                    let (
+                        mut changes,
+                        contact_graph,
+                        mut constraint_graph,
+                        mut islands,
+                        mut body_islands,
+                    ) = state.0.get_mut(world).unwrap();
+
+                    for change in changes.drain(..) {
+                        apply_contact_status_change(
+                            change,
+                            &contact_graph,
+                            &mut constraint_graph,
+                            islands.as_deref_mut(),
+                            &mut body_islands,
+                            &mut islands_to_wake,
+                        );
+                    }
+                }
+
+                if !islands_to_wake.is_empty() {
+                    islands_to_wake.sort_unstable();
+                    islands_to_wake.dedup();
+
+                    // Wake up the islands that were previously sleeping.
+                    WakeIslands(islands_to_wake).apply(world);
+                }
+            },
+        );
     }
 }
 
@@ -165,8 +465,8 @@ impl Plugin for SolverPlugin {
 ///
 /// Note that this is *not* used to scale forces or any other user-facing inputs or outputs.
 /// Instead, the value is only used to scale some internal length-based tolerances, such as
-/// [`SleepingThreshold::linear`] and [`NarrowPhaseConfig::default_speculative_margin`],
-/// as well as the scale used for [debug rendering](PhysicsDebugPlugin).
+/// [`SleepingThreshold::linear`] and [`NarrowPhaseConfig::contact_tolerance`], as well as
+/// the scale used for [debug rendering](PhysicsDebugPlugin).
 ///
 /// Choosing the appropriate length unit can help improve stability and robustness.
 ///
@@ -197,7 +497,7 @@ impl Plugin for SolverPlugin {
 /// ```
 #[derive(Resource, Clone, Debug, Deref, DerefMut, PartialEq, Reflect)]
 #[reflect(Resource)]
-pub struct PhysicsLengthUnit(pub Scalar);
+pub struct PhysicsLengthUnit(pub f32);
 
 impl Default for PhysicsLengthUnit {
     fn default() -> Self {
@@ -223,7 +523,7 @@ pub struct SolverConfig {
     /// Note that making the value too large can cause instability.
     ///
     /// Default: `10.0`.
-    pub contact_damping_ratio: Scalar,
+    pub contact_damping_ratio: f32,
 
     /// Scales the frequency used for contacts. A higher frequency
     /// makes contact responses faster and reduces visible springiness,
@@ -236,7 +536,7 @@ pub struct SolverConfig {
     /// if the factor is too large.
     ///
     /// Default: `1.5`
-    pub contact_frequency_factor: Scalar,
+    pub contact_frequency_factor: f32,
 
     /// The maximum speed at which overlapping bodies are pushed apart by the solver.
     ///
@@ -246,10 +546,10 @@ pub struct SolverConfig {
     /// This is implicitly scaled by the [`PhysicsLengthUnit`].
     ///
     /// Default: `4.0`
-    pub max_overlap_solve_speed: Scalar,
+    pub max_overlap_solve_speed: f32,
 
     /// The coefficient in the `[0, 1]` range applied to
-    /// [warm start](SubstepSolverSet::WarmStart) impulses.
+    /// [warm start](SubstepSolverSystems::WarmStart) impulses.
     ///
     /// Warm starting uses the impulses from the previous frame as the initial
     /// solution for the current frame. This helps the solver reach the desired
@@ -258,7 +558,7 @@ pub struct SolverConfig {
     /// The coefficient should typically be set to `1.0`.
     ///
     /// Default: `1.0`
-    pub warm_start_coefficient: Scalar,
+    pub warm_start_coefficient: f32,
 
     /// The minimum speed along the contact normal in units per second
     /// for [restitution](Restitution) to be applied.
@@ -271,7 +571,7 @@ pub struct SolverConfig {
     /// This is implicitly scaled by the [`PhysicsLengthUnit`].
     ///
     /// Default: `1.0`
-    pub restitution_threshold: Scalar,
+    pub restitution_threshold: f32,
 
     /// The number of iterations used for applying [restitution](Restitution).
     ///
@@ -329,8 +629,8 @@ fn update_contact_softness(
     substep_time: Res<Time<Substeps>>,
 ) {
     if solver_config.is_changed() || physics_time.is_changed() || substep_time.is_changed() {
-        let dt = physics_time.delta_secs_f64() as Scalar;
-        let h = substep_time.delta_secs_f64() as Scalar;
+        let dt = physics_time.delta_secs();
+        let h = substep_time.delta_secs();
 
         // The contact frequency should at most be half of the time step due to Nyquist's theorem.
         // https://en.wikipedia.org/wiki/Nyquist%E2%80%93Shannon_sampling_theorem
@@ -356,7 +656,7 @@ pub struct ContactConstraints(pub Vec<ContactConstraint>);
 pub(super) struct BodyQuery {
     pub(super) rb: Read<RigidBody>,
     pub(super) linear_velocity: Read<LinearVelocity>,
-    pub(super) inertia: Option<Read<SolverBodyInertia>>,
+    pub(super) index: Option<Read<SolverBodyIndex>>,
 }
 
 fn prepare_contact_constraints(
@@ -364,6 +664,7 @@ fn prepare_contact_constraints(
     mut constraint_graph: ResMut<ConstraintGraph>,
     mut diagnostics: ResMut<SolverDiagnostics>,
     bodies: Query<BodyQuery, RigidBodyActiveFilter>,
+    solver_bodies: Res<SolverBodies>,
     narrow_phase_config: Res<NarrowPhaseConfig>,
     contact_softness: Res<ContactSoftnessCoefficients>,
 ) {
@@ -396,7 +697,7 @@ fn prepare_contact_constraints(
             let manifold_index = handle.manifold_index;
             let manifold = &contact_pair.manifolds[manifold_index];
 
-            if contact_pair.is_sensor() {
+            if !contact_pair.generates_constraints() {
                 continue;
             }
 
@@ -420,11 +721,24 @@ fn prepare_contact_constraints(
                 continue;
             }
 
+            // Look up the solver body indices and inertias, falling back to dummy inertia
+            // for static bodies without an associated solver body.
+            let index1 = body1.index.copied().unwrap_or(SolverBodyIndex::INVALID);
+            let index2 = body2.index.copied().unwrap_or(SolverBodyIndex::INVALID);
+            let inertia1 = solver_bodies
+                .get_inertia(index1)
+                .unwrap_or(&SolverBodyInertia::DUMMY);
+            let inertia2 = solver_bodies
+                .get_inertia(index2)
+                .unwrap_or(&SolverBodyInertia::DUMMY);
+
             let constraint = ContactConstraint::generate(
-                body1_entity,
-                body2_entity,
-                body1,
-                body2,
+                index1,
+                index2,
+                inertia1,
+                inertia2,
+                body1.linear_velocity.0,
+                body2.linear_velocity.0,
                 contact_pair.contact_id,
                 manifold,
                 manifold_index,
@@ -448,21 +762,23 @@ fn prepare_contact_constraints(
 
 /// Warm starts the solver by applying the impulses from the previous frame or substep.
 ///
-/// See [`SubstepSolverSet::WarmStart`] for more information.
+/// See [`SubstepSolverSystems::WarmStart`] for more information.
 fn warm_start(
-    bodies: Query<(&mut SolverBody, &SolverBodyInertia)>,
+    mut solver_bodies: ResMut<SolverBodies>,
     mut constraint_graph: ResMut<ConstraintGraph>,
     solver_config: Res<SolverConfig>,
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
 
+    let access = solver_bodies.access();
+
     // Warm start overflow constraints serially. They have lower priority, so they are solved first.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
         .contact_constraints
         .iter_mut()
     {
-        warm_start_internal(&bodies, constraint, solver_config.warm_start_coefficient);
+        warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
     }
 
     // Warm start constraints in each color in parallel.
@@ -473,7 +789,7 @@ fn warm_start(
         .filter(|color| !color.contact_constraints.is_empty())
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
-            warm_start_internal(&bodies, constraint, solver_config.warm_start_coefficient);
+            warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
         });
     }
 
@@ -481,9 +797,9 @@ fn warm_start(
 }
 
 fn warm_start_internal(
-    bodies: &Query<(&mut SolverBody, &SolverBodyInertia)>,
+    access: &SolverBodiesAccess,
     constraint: &mut ContactConstraint,
-    warm_start_coefficient: Scalar,
+    warm_start_coefficient: f32,
 ) {
     debug_assert!(!constraint.points.is_empty());
 
@@ -493,13 +809,19 @@ fn warm_start_internal(
     let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
     let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
-    // Get the solver bodies for the two colliding entities.
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body1) } {
-        body1 = body.into_inner();
+    // Get the solver bodies for the two colliding bodies. A dummy body is used
+    // for static bodies without an associated solver body.
+    //
+    // SAFETY: Constraint graph coloring guarantees that the two bodies are distinct, and that no
+    //         other constraint solved in parallel within this color touches the same bodies.
+    let (b1, b2) =
+        unsafe { access.get_pair_unchecked_mut(constraint.body_index1, constraint.body_index2) };
+    if let Some((body, inertia)) = b1 {
+        body1 = body;
         inertia1 = inertia;
     }
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body2) } {
-        body2 = body.into_inner();
+    if let Some((body, inertia)) = b2 {
+        body2 = body;
         inertia2 = inertia;
     }
 
@@ -522,13 +844,13 @@ fn warm_start_internal(
 /// If `use_bias` is `true`, the impulses will be boosted to account for overlap.
 /// The solver should often be run twice per frame or substep: first with the bias,
 /// and then without it to *relax* the velocities and reduce overshooting caused by
-/// [warm starting](SubstepSolverSet::WarmStart).
+/// [warm starting](SubstepSolverSystems::WarmStart).
 ///
-/// See [`SubstepSolverSet::SolveConstraints`] and [`SubstepSolverSet::Relax`] for more information.
+/// See [`SubstepSolverSystems::SolveConstraints`] and [`SubstepSolverSystems::Relax`] for more information.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn solve_contacts<const USE_BIAS: bool>(
-    bodies: Query<(&mut SolverBody, &SolverBodyInertia)>,
+    mut solver_bodies: ResMut<SolverBodies>,
     mut constraint_graph: ResMut<ConstraintGraph>,
     solver_config: Res<SolverConfig>,
     length_unit: Res<PhysicsLengthUnit>,
@@ -537,8 +859,10 @@ fn solve_contacts<const USE_BIAS: bool>(
 ) {
     let start = crate::utils::Instant::now();
 
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
+
+    let access = solver_bodies.access();
 
     // Solve overflow constraints serially. They have lower priority, so they are solved first.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
@@ -546,7 +870,7 @@ fn solve_contacts<const USE_BIAS: bool>(
         .iter_mut()
     {
         solve_contacts_internal::<USE_BIAS>(
-            &bodies,
+            &access,
             constraint,
             max_overlap_solve_speed,
             delta_secs,
@@ -562,7 +886,7 @@ fn solve_contacts<const USE_BIAS: bool>(
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
             solve_contacts_internal::<USE_BIAS>(
-                &bodies,
+                &access,
                 constraint,
                 max_overlap_solve_speed,
                 delta_secs,
@@ -578,10 +902,10 @@ fn solve_contacts<const USE_BIAS: bool>(
 }
 
 fn solve_contacts_internal<const USE_BIAS: bool>(
-    bodies: &Query<(&mut SolverBody, &SolverBodyInertia)>,
+    access: &SolverBodiesAccess,
     constraint: &mut ContactConstraint,
-    max_overlap_solve_speed: Scalar,
-    delta_secs: Scalar,
+    max_overlap_solve_speed: f32,
+    delta_secs: f32,
 ) {
     let mut dummy_body1 = SolverBody::DUMMY;
     let mut dummy_body2 = SolverBody::DUMMY;
@@ -589,13 +913,19 @@ fn solve_contacts_internal<const USE_BIAS: bool>(
     let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
     let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
-    // Get the solver bodies for the two colliding entities.
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body1) } {
-        body1 = body.into_inner();
+    // Get the solver bodies for the two colliding bodies. A dummy body is used
+    // for static bodies without an associated solver body.
+    //
+    // SAFETY: Constraint graph coloring guarantees that the two bodies are distinct, and that no
+    //         other constraint solved in parallel within this color touches the same bodies.
+    let (b1, b2) =
+        unsafe { access.get_pair_unchecked_mut(constraint.body_index1, constraint.body_index2) };
+    if let Some((body, inertia)) = b1 {
+        body1 = body;
         inertia1 = inertia;
     }
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body2) } {
-        body2 = body.into_inner();
+    if let Some((body, inertia)) = b2 {
+        body2 = body;
         inertia2 = inertia;
     }
 
@@ -606,13 +936,12 @@ fn solve_contacts_internal<const USE_BIAS: bool>(
         _ => {}
     }
 
-    constraint.solve(
+    constraint.solve::<USE_BIAS>(
         body1,
         body2,
         inertia1,
         inertia2,
         delta_secs,
-        USE_BIAS,
         max_overlap_solve_speed,
     );
 }
@@ -627,7 +956,7 @@ fn solve_contacts_internal<const USE_BIAS: bool>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn solve_restitution(
-    bodies: Query<(&mut SolverBody, &SolverBodyInertia)>,
+    mut solver_bodies: ResMut<SolverBodies>,
     mut constraint_graph: ResMut<ConstraintGraph>,
     solver_config: Res<SolverConfig>,
     length_unit: Res<PhysicsLengthUnit>,
@@ -638,13 +967,15 @@ fn solve_restitution(
     // The restitution threshold determining the speed required for restitution to be applied.
     let threshold = solver_config.restitution_threshold * length_unit.0;
 
+    let access = solver_bodies.access();
+
     // Solve restitution for overflow constraints serially. They have lower priority, so they are solved first.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
         .contact_constraints
         .iter_mut()
     {
         solve_restitution_internal(
-            &bodies,
+            &access,
             constraint,
             threshold,
             solver_config.restitution_iterations,
@@ -660,7 +991,7 @@ fn solve_restitution(
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
             solve_restitution_internal(
-                &bodies,
+                &access,
                 constraint,
                 threshold,
                 solver_config.restitution_iterations,
@@ -672,9 +1003,9 @@ fn solve_restitution(
 }
 
 fn solve_restitution_internal(
-    bodies: &Query<(&mut SolverBody, &SolverBodyInertia)>,
+    access: &SolverBodiesAccess,
     constraint: &mut ContactConstraint,
-    threshold: Scalar,
+    threshold: f32,
     iterations: usize,
 ) {
     let restitution = constraint.restitution;
@@ -689,13 +1020,19 @@ fn solve_restitution_internal(
     let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
     let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
-    // Get the solver bodies for the two colliding entities.
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body1) } {
-        body1 = body.into_inner();
+    // Get the solver bodies for the two colliding bodies. A dummy body is used
+    // for static bodies without an associated solver body.
+    //
+    // SAFETY: Constraint graph coloring guarantees that the two bodies are distinct, and that no
+    //         other constraint solved in parallel within this color touches the same bodies.
+    let (b1, b2) =
+        unsafe { access.get_pair_unchecked_mut(constraint.body_index1, constraint.body_index2) };
+    if let Some((body, inertia)) = b1 {
+        body1 = body;
         inertia1 = inertia;
     }
-    if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(constraint.body2) } {
-        body2 = body.into_inner();
+    if let Some((body, inertia)) = b2 {
+        body2 = body;
         inertia2 = inertia;
     }
 
@@ -717,7 +1054,7 @@ fn solve_restitution_internal(
 }
 
 /// Copies contact impulses from [`ContactConstraints`] to the contacts in the [`ContactGraph`].
-/// They will be used for [warm starting](SubstepSolverSet::WarmStart).
+/// They will be used for [warm starting](SubstepSolverSystems::WarmStart).
 fn store_contact_impulses(
     mut contact_graph: ResMut<ContactGraph>,
     mut constraint_graph: ResMut<ConstraintGraph>,
@@ -756,36 +1093,71 @@ fn store_contact_impulses(
 /// Applies velocity corrections caused by joint damping.
 #[allow(clippy::type_complexity)]
 pub fn joint_damping<T: Component + EntityConstraint<2>>(
-    mut bodies: Query<(&RigidBody, &mut SolverBody, &SolverBodyInertia)>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    index_query: Query<&SolverBodyIndex>,
     joints: Query<(&T, &JointDamping)>,
     time: Res<Time>,
 ) {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
+
+    let access = solver_bodies.access();
+
+    let mut dummy_body1 = SolverBody::DUMMY;
+    let mut dummy_body2 = SolverBody::DUMMY;
 
     for (joint, damping) in &joints {
-        if let Ok([(rb1, mut body1, inertia1), (rb2, mut body2, inertia2)]) =
-            bodies.get_many_mut(joint.entities())
-        {
-            let delta_omega = (body2.angular_velocity - body1.angular_velocity)
-                * (damping.angular * delta_secs).min(1.0);
+        let entities = joint.entities();
 
-            if rb1.is_dynamic() {
-                body1.angular_velocity += delta_omega;
-            }
-            if rb2.is_dynamic() {
-                body2.angular_velocity -= delta_omega;
-            }
+        // Map the two jointed entities to their solver body indices, using an invalid index
+        // for static bodies without an associated solver body.
+        let index1 = index_query
+            .get(entities[0])
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
+        let index2 = index_query
+            .get(entities[1])
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
 
-            let delta_v = (body2.linear_velocity - body1.linear_velocity)
-                * (damping.linear * delta_secs).min(1.0);
-
-            let w1 = inertia1.effective_inv_mass();
-            let w2 = inertia2.effective_inv_mass();
-
-            let p = delta_v * (w1 + w2).recip_or_zero();
-
-            body1.linear_velocity += p * w1;
-            body2.linear_velocity -= p * w2;
+        if index1 == index2 {
+            continue;
         }
+
+        let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
+        let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
+
+        // Get the solver bodies for the two jointed bodies.
+        //
+        // SAFETY: The two jointed bodies are distinct, and joints are processed serially here.
+        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(index1, index2) };
+        if let Some((body, inertia)) = b1 {
+            body1 = body;
+            inertia1 = inertia;
+        }
+        if let Some((body, inertia)) = b2 {
+            body2 = body;
+            inertia2 = inertia;
+        }
+
+        let delta_omega = (body2.angular_velocity - body1.angular_velocity)
+            * (damping.angular * delta_secs).min(1.0);
+
+        if !body1.flags.is_kinematic() {
+            body1.angular_velocity += delta_omega;
+        }
+        if !body2.flags.is_kinematic() {
+            body2.angular_velocity -= delta_omega;
+        }
+
+        let delta_v = (body2.linear_velocity - body1.linear_velocity)
+            * (damping.linear * delta_secs).min(1.0);
+
+        let w1 = inertia1.effective_inv_mass();
+        let w2 = inertia2.effective_inv_mass();
+
+        let p = delta_v * (w1 + w2).recip_or_zero();
+
+        body1.linear_velocity += p * w1;
+        body2.linear_velocity -= p * w2;
     }
 }

@@ -78,9 +78,10 @@ pub(crate) use path_macro::impl_diagnostic_paths;
 #[cfg(feature = "bevy_diagnostic")]
 pub use total::{PhysicsTotalDiagnostics, PhysicsTotalDiagnosticsPlugin};
 
-use crate::{PhysicsStepSet, schedule::PhysicsSchedule};
+use crate::{PhysicsStepSystems, schedule::PhysicsSchedule};
 use bevy::{
     diagnostic::DiagnosticPath,
+    ecs::component::Mutable,
     prelude::{App, IntoScheduleConfigs, ResMut, Resource, SystemSet},
 };
 #[cfg(feature = "bevy_diagnostic")]
@@ -110,8 +111,8 @@ impl Plugin for PhysicsDiagnosticsPlugin {
         app.configure_sets(
             PhysicsSchedule,
             (
-                PhysicsDiagnosticsSystems::Reset.before(PhysicsStepSet::First),
-                PhysicsDiagnosticsSystems::WriteDiagnostics.after(PhysicsStepSet::Last),
+                PhysicsDiagnosticsSystems::Reset.before(PhysicsStepSystems::First),
+                PhysicsDiagnosticsSystems::WriteDiagnostics.after(PhysicsStepSystems::Last),
             ),
         );
     }
@@ -127,7 +128,7 @@ pub enum PhysicsDiagnosticsSystems {
 }
 
 /// A trait for resources storing timers and counters for [physics diagnostics](crate::diagnostics).
-pub trait PhysicsDiagnostics: Default + Resource {
+pub trait PhysicsDiagnostics: Default + Resource<Mutability = Mutable> {
     /// Maps diagnostic paths to their respective duration fields.
     fn timer_paths(&self) -> Vec<(&'static DiagnosticPath, Duration)> {
         Vec::new()
@@ -178,7 +179,7 @@ impl AppDiagnosticsExt for App {
         // Make sure the system set exists, even if `PhysicsDiagnosticsPlugin` is not added.
         self.configure_sets(
             PhysicsSchedule,
-            PhysicsDiagnosticsSystems::Reset.before(PhysicsStepSet::First),
+            PhysicsDiagnosticsSystems::Reset.before(PhysicsStepSystems::First),
         );
 
         // Add a system to reset the resource, even if `PhysicsDiagnosticsPlugin` is not added.

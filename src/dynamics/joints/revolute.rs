@@ -1,5 +1,5 @@
 use crate::{
-    dynamics::joints::{EntityConstraint, JointSet},
+    dynamics::joints::{EntityConstraint, JointSystems, motor::AngularMotor},
     prelude::*,
 };
 use bevy::{
@@ -37,6 +37,9 @@ use bevy::{
 )]
 ///
 #[doc = include_str!("./images/revolute_joint.svg")]
+///
+/// The joint can also include an [`AngularMotor`] for driving the rotation about the pivot point.
+/// Use this to create wheels, fans, servos, or other rotating mechanisms.
 #[derive(Component, Clone, Debug, PartialEq, Reflect)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
@@ -57,16 +60,18 @@ pub struct RevoluteJoint {
     ///
     /// By default, this is the z-axis.
     #[cfg(feature = "3d")]
-    pub hinge_axis: Vector,
+    pub hinge_axis: Vec3,
     /// The extents of the allowed relative rotation of the bodies.
     pub angle_limit: Option<AngleLimit>,
     /// The compliance of the point-to-point constraint (inverse of stiffness, m / N).
-    pub point_compliance: Scalar,
+    pub point_compliance: f32,
     /// The compliance used for aligning the bodies along the [`hinge_axis`](Self::hinge_axis) (inverse of stiffness, N * m / rad).
     #[cfg(feature = "3d")]
-    pub align_compliance: Scalar,
+    pub align_compliance: f32,
     /// The compliance of the angle limit (inverse of stiffness, N * m / rad).
-    pub limit_compliance: Scalar,
+    pub limit_compliance: f32,
+    /// A motor for driving the joint.
+    pub motor: AngularMotor,
 }
 
 impl EntityConstraint<2> for RevoluteJoint {
@@ -78,7 +83,7 @@ impl EntityConstraint<2> for RevoluteJoint {
 impl RevoluteJoint {
     /// The default [`hinge_axis`](Self::hinge_axis) for a revolute joint.
     #[cfg(feature = "3d")]
-    pub const DEFAULT_HINGE_AXIS: Vector = Vector::Z;
+    pub const DEFAULT_HINGE_AXIS: Vec3 = Vec3::Z;
 
     /// Creates a new [`RevoluteJoint`] between two entities.
     #[inline]
@@ -95,6 +100,7 @@ impl RevoluteJoint {
             #[cfg(feature = "3d")]
             align_compliance: 0.0,
             limit_compliance: 0.0,
+            motor: AngularMotor::new_disabled(MotorModel::DEFAULT),
         }
     }
 
@@ -103,20 +109,20 @@ impl RevoluteJoint {
     /// The axis should be a unit vector. By default, this is the z-axis.
     #[inline]
     #[cfg(feature = "3d")]
-    pub const fn with_hinge_axis(mut self, axis: Vector) -> Self {
+    pub const fn with_hinge_axis(mut self, axis: Vec3) -> Self {
         self.hinge_axis = axis;
         self
     }
 
     /// Sets the [`hinge_axis`](Self::hinge_axis) about which the bodies can rotate relative to each other.
     ///
-    /// The axis should be a unit vector. By default, this is the x-axis.
+    /// The axis should be a unit vector. By default, this is the z-axis.
     ///
     /// This method is deprecated in favor of [`with_hinge_axis`](Self::with_hinge_axis).
     #[inline]
     #[deprecated(since = "0.4.0", note = "Use `with_hinge_axis` instead.")]
     #[cfg(feature = "3d")]
-    pub const fn with_aligned_axis(self, axis: Vector) -> Self {
+    pub const fn with_aligned_axis(self, axis: Vec3) -> Self {
         self.with_hinge_axis(axis)
     }
 
@@ -138,7 +144,7 @@ impl RevoluteJoint {
     ///
     /// This configures the [`JointAnchor`] of each [`JointFrame`].
     #[inline]
-    pub const fn with_anchor(mut self, anchor: Vector) -> Self {
+    pub const fn with_anchor(mut self, anchor: RVector) -> Self {
         self.frame1.anchor = JointAnchor::FromGlobal(anchor);
         self.frame2.anchor = JointAnchor::FromGlobal(anchor);
         self
@@ -270,7 +276,7 @@ impl RevoluteJoint {
     /// and the local basis has not yet been computed, this will return `None`.
     #[inline]
     #[cfg(feature = "3d")]
-    pub fn local_hinge_axis1(&self) -> Option<Vector> {
+    pub fn local_hinge_axis1(&self) -> Option<Vec3> {
         match self.frame1.basis {
             JointBasis::Local(basis) => Some(basis * self.hinge_axis),
             _ => None,
@@ -286,7 +292,7 @@ impl RevoluteJoint {
     /// and the local basis has not yet been computed, this will return `None`.
     #[inline]
     #[cfg(feature = "3d")]
-    pub fn local_hinge_axis2(&self) -> Option<Vector> {
+    pub fn local_hinge_axis2(&self) -> Option<Vec3> {
         match self.frame2.basis {
             JointBasis::Local(basis) => Some(basis * self.hinge_axis),
             _ => None,
@@ -295,7 +301,7 @@ impl RevoluteJoint {
 
     /// Sets the limits of the allowed relative rotation.
     #[inline]
-    pub const fn with_angle_limits(mut self, min: Scalar, max: Scalar) -> Self {
+    pub const fn with_angle_limits(mut self, min: f32, max: f32) -> Self {
         self.angle_limit = Some(AngleLimit::new(min, max));
         self
     }
@@ -306,7 +312,7 @@ impl RevoluteJoint {
         since = "0.4.0",
         note = "Use `with_point_compliance`, `with_align_compliance`, and `with_limit_compliance` instead."
     )]
-    pub const fn with_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_compliance(mut self, compliance: f32) -> Self {
         self.point_compliance = compliance;
         #[cfg(feature = "3d")]
         {
@@ -318,7 +324,7 @@ impl RevoluteJoint {
 
     /// Sets the compliance of the point-to-point constraint (inverse of stiffness, m / N).
     #[inline]
-    pub const fn with_point_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_point_compliance(mut self, compliance: f32) -> Self {
         self.point_compliance = compliance;
         self
     }
@@ -326,15 +332,22 @@ impl RevoluteJoint {
     /// Sets the compliance of the axis alignment constraint (inverse of stiffness, N * m / rad).
     #[inline]
     #[cfg(feature = "3d")]
-    pub const fn with_align_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_align_compliance(mut self, compliance: f32) -> Self {
         self.align_compliance = compliance;
         self
     }
 
     /// Sets the compliance of the angle limit (inverse of stiffness, N * m / rad).
     #[inline]
-    pub const fn with_limit_compliance(mut self, compliance: Scalar) -> Self {
+    pub const fn with_limit_compliance(mut self, compliance: f32) -> Self {
         self.limit_compliance = compliance;
+        self
+    }
+
+    /// Sets the motor for the joint.
+    #[inline]
+    pub const fn with_motor(mut self, motor: AngularMotor) -> Self {
+        self.motor = motor;
         self
     }
 }
@@ -347,10 +360,9 @@ impl MapEntities for RevoluteJoint {
 }
 
 pub(super) fn plugin(app: &mut App) {
-    app.register_type::<RevoluteJoint>();
     app.add_systems(
         PhysicsSchedule,
-        update_local_frames.in_set(JointSet::PrepareLocalFrames),
+        update_local_frames.in_set(JointSystems::PrepareLocalFrames),
     );
 }
 
@@ -372,7 +384,7 @@ fn update_local_frames(
         };
 
         let [frame1, frame2] =
-            JointFrame::compute_local(joint.frame1, joint.frame2, pos1.0, pos2.0, rot1, rot2);
+            JointFrame::compute_local(joint.frame1, joint.frame2, pos1.0, pos2.0, *rot1, *rot2);
         joint.frame1 = frame1;
         joint.frame2 = frame2;
     }
@@ -384,7 +396,7 @@ impl DebugRenderConstraint<2> for RevoluteJoint {
 
     fn debug_render(
         &self,
-        positions: [Vector; 2],
+        positions: [RVector; 2],
         rotations: [Rotation; 2],
         _context: &mut Self::Context,
         gizmos: &mut Gizmos<PhysicsGizmos>,
@@ -400,8 +412,8 @@ impl DebugRenderConstraint<2> for RevoluteJoint {
             return;
         };
 
-        let anchor1 = pos1 + rot1 * local_anchor1;
-        let anchor2 = pos2 + rot2 * local_anchor2;
+        let anchor1 = pos1 + (rot1 * local_anchor1).real();
+        let anchor2 = pos2 + (rot2 * local_anchor2).real();
 
         if let Some(anchor_color) = config.joint_anchor_color {
             gizmos.draw_line(pos1, anchor1, anchor_color);

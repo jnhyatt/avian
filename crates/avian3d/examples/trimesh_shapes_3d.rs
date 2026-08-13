@@ -6,12 +6,10 @@
 
 use avian3d::prelude::*;
 use bevy::{
+    asset::RenderAssetUsages,
     color::palettes::css::SILVER,
     prelude::*,
-    render::{
-        render_asset::RenderAssetUsages,
-        render_resource::{Extent3d, TextureDimension, TextureFormat},
-    },
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 use examples_common_3d::ExampleCommonPlugin;
 
@@ -77,7 +75,7 @@ fn setup(
         PointLight {
             intensity: 8_000_000.0,
             range: 100.,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(8.0, 16.0, 8.0),

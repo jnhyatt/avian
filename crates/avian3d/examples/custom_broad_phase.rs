@@ -1,4 +1,4 @@
-use avian3d::{dynamics::solver::joint_graph::JointGraph, math::*, prelude::*};
+use avian3d::{dynamics::joints::joint_graph::JointGraph, prelude::*};
 use bevy::prelude::*;
 use examples_common_3d::ExampleCommonPlugin;
 
@@ -11,7 +11,7 @@ fn main() {
     app.add_plugins(
         PhysicsPlugins::default()
             .build()
-            .disable::<BroadPhasePlugin>()
+            .disable::<BvhBroadPhasePlugin>()
             .add(BruteForceBroadPhasePlugin),
     );
 
@@ -37,14 +37,14 @@ fn setup(
         MeshMaterial3d(materials.add(Color::srgb(0.8, 0.7, 0.6))),
         Transform::from_xyz(0.0, 4.0, 0.0),
         RigidBody::Dynamic,
-        AngularVelocity(Vector::new(2.5, 3.4, 1.6)),
+        AngularVelocity(Vec3::new(2.5, 3.4, 1.6)),
         Collider::cuboid(1.0, 1.0, 1.0),
     ));
     // Light
     commands.spawn((
         PointLight {
             intensity: 2_000_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(4.0, 8.0, 4.0),
@@ -67,7 +67,7 @@ impl Plugin for BruteForceBroadPhasePlugin {
         // Add the broad phase system into the broad phase set.
         app.add_systems(
             PhysicsSchedule,
-            collect_collision_pairs.in_set(PhysicsStepSet::BroadPhase),
+            collect_collision_pairs.in_set(BroadPhaseSystems::CollectCollisions),
         );
     }
 }
@@ -110,13 +110,10 @@ fn collect_collision_pairs(
             continue;
         }
 
-        // Create a contact pair as non-touching by adding an edge between the entities in the contact graph.
+        // Create a contact in the contact graph.
         let mut contact_edge = ContactEdge::new(collider1, collider2);
         contact_edge.body1 = Some(collider_of1.body);
         contact_edge.body2 = Some(collider_of2.body);
-        contact_graph.add_edge_with(contact_edge, |contact_pair| {
-            contact_pair.body1 = Some(collider_of1.body);
-            contact_pair.body2 = Some(collider_of2.body);
-        });
+        contact_graph.add_edge(contact_edge);
     }
 }

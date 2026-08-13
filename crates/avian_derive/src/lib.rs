@@ -1,8 +1,8 @@
-//! Provides derive implementations for [Avian Physics](https://github.com/Jondolf/avian).
+//! Provides derive implementations for [Avian Physics](https://github.com/avianphysics/avian).
 
 use proc_macro::TokenStream;
 
-use proc_macro_error2::{abort, emit_error, proc_macro_error};
+use proc_macro_error3::{abort, emit_error, proc_macro_error};
 use quote::quote;
 use syn::{Data, DeriveInput, parse_macro_input, spanned::Spanned};
 

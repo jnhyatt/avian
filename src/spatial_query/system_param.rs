@@ -1,5 +1,6 @@
-use crate::prelude::*;
+use crate::{collider_tree::ColliderTrees, collision::collider::contact_query, prelude::*};
 use bevy::{ecs::system::SystemParam, prelude::*};
+use parry::query::ShapeCastOptions;
 
 /// A system parameter for performing [spatial queries](spatial_query).
 ///
@@ -27,13 +28,13 @@ use bevy::{ecs::system::SystemParam, prelude::*};
 /// # #[cfg(feature = "2d")]
 /// # use avian2d::prelude::*;
 /// # #[cfg(feature = "3d")]
-/// use avian3d::prelude::*;
+/// use avian3d::{math::RVec3, prelude::*};
 /// use bevy::prelude::*;
 ///
-/// # #[cfg(all(feature = "3d", feature = "f32"))]
+/// # #[cfg(feature = "3d")]
 /// fn print_hits(spatial_query: SpatialQuery) {
 ///     // Ray origin and direction
-///     let origin = Vec3::ZERO;
+///     let origin = RVec3::ZERO;
 ///     let direction = Dir3::X;
 ///
 ///     // Configuration for the ray cast
@@ -57,30 +58,12 @@ use bevy::{ecs::system::SystemParam, prelude::*};
 /// ```
 #[derive(SystemParam)]
 pub struct SpatialQuery<'w, 's> {
-    pub(crate) colliders: Query<
-        'w,
-        's,
-        (
-            Entity,
-            &'static Position,
-            &'static Rotation,
-            &'static Collider,
-            &'static CollisionLayers,
-        ),
-        Without<ColliderDisabled>,
-    >,
-    /// The [`SpatialQueryPipeline`].
-    pub query_pipeline: ResMut<'w, SpatialQueryPipeline>,
+    colliders: Query<'w, 's, (&'static Position, &'static Rotation, &'static Collider)>,
+    aabbs: Query<'w, 's, &'static ColliderAabb>,
+    collider_trees: Res<'w, ColliderTrees>,
 }
 
 impl SpatialQuery<'_, '_> {
-    /// Updates the colliders in the pipeline. This is done automatically once per physics frame in
-    /// [`PhysicsStepSet::SpatialQuery`], but if you modify colliders or their positions before that, you can
-    /// call this to make sure the data is up to date when performing spatial queries using [`SpatialQuery`].
-    pub fn update_pipeline(&mut self) {
-        self.query_pipeline.update(self.colliders.iter());
-    }
-
     /// Casts a [ray](spatial_query#raycasting) and computes the closest [hit](RayHitData) with a collider.
     /// If there are no hits, `None` is returned.
     ///
@@ -99,13 +82,13 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Ray origin and direction
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let direction = Dir3::X;
     ///
     ///     // Configuration for the ray cast
@@ -127,14 +110,13 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::ray_hits_callback`]
     pub fn cast_ray(
         &self,
-        origin: Vector,
+        origin: RVector,
         direction: Dir,
-        max_distance: Scalar,
+        max_distance: f32,
         solid: bool,
         filter: &SpatialQueryFilter,
     ) -> Option<RayHitData> {
-        self.query_pipeline
-            .cast_ray(origin, direction, max_distance, solid, filter)
+        self.cast_ray_predicate(origin, direction, max_distance, solid, filter, &|_| true)
     }
 
     /// Casts a [ray](spatial_query#raycasting) and computes the closest [hit](RayHitData) with a collider.
@@ -156,16 +138,16 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
     /// #[derive(Component)]
     /// struct Invisible;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery, query: Query<&Invisible>) {
     ///     // Ray origin and direction
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let direction = Dir3::X;
     ///
     ///     // Configuration for the ray cast
@@ -193,21 +175,53 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::ray_hits_callback`]
     pub fn cast_ray_predicate(
         &self,
-        origin: Vector,
+        origin: RVector,
         direction: Dir,
-        max_distance: Scalar,
+        mut max_distance: f32,
         solid: bool,
         filter: &SpatialQueryFilter,
         predicate: &dyn Fn(Entity) -> bool,
     ) -> Option<RayHitData> {
-        self.query_pipeline.cast_ray_predicate(
-            origin,
-            direction,
-            max_distance,
-            solid,
-            filter,
-            predicate,
-        )
+        let ray = Ray::new(origin.f32(), direction);
+
+        let mut closest_hit: Option<RayHitData> = None;
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.ray_traverse_closest(ray, max_distance, |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+                if !filter.test(proxy.collider, proxy.layers) || !predicate(proxy.collider) {
+                    return f32::MAX;
+                }
+
+                let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider) else {
+                    return f32::MAX;
+                };
+
+                let Some((distance, normal)) = collider.cast_ray(
+                    position.0,
+                    *rotation,
+                    origin,
+                    *direction,
+                    max_distance,
+                    solid,
+                ) else {
+                    return f32::MAX;
+                };
+
+                if distance < max_distance {
+                    max_distance = distance;
+                    closest_hit = Some(RayHitData {
+                        entity: proxy.collider,
+                        normal,
+                        distance,
+                    });
+                }
+
+                distance
+            });
+        });
+
+        closest_hit
     }
 
     /// Casts a [ray](spatial_query#raycasting) and computes all [hits](RayHitData) until `max_hits` is reached.
@@ -231,13 +245,13 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Ray origin and direction
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let direction = Dir3::X;
     ///
     ///     // Configuration for the ray cast
@@ -262,15 +276,25 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::ray_hits_callback`]
     pub fn ray_hits(
         &self,
-        origin: Vector,
+        origin: RVector,
         direction: Dir,
-        max_distance: Scalar,
+        max_distance: f32,
         max_hits: u32,
         solid: bool,
         filter: &SpatialQueryFilter,
     ) -> Vec<RayHitData> {
-        self.query_pipeline
-            .ray_hits(origin, direction, max_distance, max_hits, solid, filter)
+        let mut hits = Vec::new();
+
+        self.ray_hits_callback(origin, direction, max_distance, solid, filter, |hit| {
+            if hits.len() < max_hits as usize {
+                hits.push(hit);
+                true
+            } else {
+                false
+            }
+        });
+
+        hits
     }
 
     /// Casts a [ray](spatial_query#raycasting) and computes all [hits](RayHitData), calling the given `callback`
@@ -294,13 +318,13 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Ray origin and direction
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let direction = Dir3::X;
     ///
     ///     // Configuration for the ray cast
@@ -308,11 +332,11 @@ impl SpatialQuery<'_, '_> {
     ///     let solid = true;
     ///     let filter = SpatialQueryFilter::default();
     ///
-    ///     // Cast ray and get all hits
+    ///     // Cast ray and get up to 20 hits
     ///     let mut hits = vec![];
-    ///     spatial_query.ray_hits_callback(origin, direction, max_distance, 20, solid, &filter, |hit| {
+    ///     spatial_query.ray_hits_callback(origin, direction, max_distance, solid, &filter, |hit| {
     ///         hits.push(hit);
-    ///         true
+    ///         hits.len() < 20
     ///     });
     ///
     ///     // Print hits
@@ -329,21 +353,45 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::ray_hits`]
     pub fn ray_hits_callback(
         &self,
-        origin: Vector,
+        origin: RVector,
         direction: Dir,
-        max_distance: Scalar,
+        max_distance: f32,
         solid: bool,
         filter: &SpatialQueryFilter,
-        callback: impl FnMut(RayHitData) -> bool,
+        mut callback: impl FnMut(RayHitData) -> bool,
     ) {
-        self.query_pipeline.ray_hits_callback(
-            origin,
-            direction,
-            max_distance,
-            solid,
-            filter,
-            callback,
-        )
+        let ray = Ray::new(origin.f32(), direction);
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.ray_traverse_all(ray, max_distance, |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+
+                if !filter.test(proxy.collider, proxy.layers) {
+                    return true;
+                }
+
+                let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider) else {
+                    return true;
+                };
+
+                let Some((distance, normal)) = collider.cast_ray(
+                    position.0,
+                    *rotation,
+                    origin,
+                    *direction,
+                    max_distance,
+                    solid,
+                ) else {
+                    return true;
+                };
+
+                callback(RayHitData {
+                    entity: proxy.collider,
+                    normal,
+                    distance,
+                })
+            });
+        });
     }
 
     /// Casts a [shape](spatial_query#shapecasting) with a given rotation and computes the closest [hit](ShapeHitData)
@@ -366,14 +414,14 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Shape properties
     ///     let shape = Collider::sphere(0.5);
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let rotation = Quat::default();
     ///     let direction = Dir3::X;
     ///
@@ -398,14 +446,21 @@ impl SpatialQuery<'_, '_> {
     pub fn cast_shape(
         &self,
         shape: &Collider,
-        origin: Vector,
-        shape_rotation: RotationValue,
+        origin: RVector,
+        shape_rotation: impl Into<Rot>,
         direction: Dir,
         config: &ShapeCastConfig,
         filter: &SpatialQueryFilter,
     ) -> Option<ShapeHitData> {
-        self.query_pipeline
-            .cast_shape(shape, origin, shape_rotation, direction, config, filter)
+        self.cast_shape_predicate(
+            shape,
+            origin,
+            shape_rotation,
+            direction,
+            config,
+            filter,
+            &|_| true,
+        )
     }
 
     /// Casts a [shape](spatial_query#shapecasting) with a given rotation and computes the closest [hit](ShapeHitData)
@@ -429,17 +484,17 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
     /// #[derive(Component)]
     /// struct Invisible;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery, query: Query<&Invisible>) {
     ///     // Shape properties
     ///     let shape = Collider::sphere(0.5);
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let rotation = Quat::default();
     ///     let direction = Dir3::X;
     ///
@@ -448,7 +503,7 @@ impl SpatialQuery<'_, '_> {
     ///     let filter = SpatialQueryFilter::default();
     ///
     ///     // Cast shape and get the first hit that matches the predicate
-    ///     let hit = spatial_query.cast_shape(&shape, origin, rotation, direction, &config, &filter, &|entity| {
+    ///     let hit = spatial_query.cast_shape_predicate(&shape, origin, rotation, direction, &config, &filter, &|entity| {
     ///        // Skip entities with the `Invisible` component.
     ///        !query.contains(entity)
     ///     });
@@ -468,26 +523,84 @@ impl SpatialQuery<'_, '_> {
     pub fn cast_shape_predicate(
         &self,
         shape: &Collider,
-        origin: Vector,
-        shape_rotation: RotationValue,
+        origin: RVector,
+        shape_rotation: impl Into<Rot>,
         direction: Dir,
         config: &ShapeCastConfig,
         filter: &SpatialQueryFilter,
         predicate: &dyn Fn(Entity) -> bool,
     ) -> Option<ShapeHitData> {
-        self.query_pipeline.cast_shape_predicate(
-            shape,
-            origin,
-            shape_rotation,
-            direction,
-            config,
-            filter,
-            predicate,
-        )
+        let shape_rotation = shape_rotation.into();
+
+        let mut closest_distance = config.max_distance;
+        let mut closest_hit: Option<ShapeHitData> = None;
+
+        let aabb = obvhs::aabb::Aabb::from(shape.aabb(origin, shape_rotation, 0.0));
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.sweep_traverse_closest(
+                aabb,
+                direction,
+                closest_distance,
+                config.target_distance,
+                |proxy_id| {
+                    let proxy = tree.get_proxy(proxy_id).unwrap();
+
+                    if !filter.test(proxy.collider, proxy.layers) || !predicate(proxy.collider) {
+                        return f32::MAX;
+                    }
+
+                    let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider)
+                    else {
+                        return f32::MAX;
+                    };
+
+                    let pose1 = make_pose(position.0, *rotation);
+                    let pose2 = make_pose(origin, shape_rotation);
+
+                    let Ok(Some(hit)) = parry::query::cast_shapes(
+                        &pose1,
+                        RVector::ZERO,
+                        collider.shape_scaled().as_ref(),
+                        &pose2,
+                        direction.real(),
+                        shape.shape_scaled().as_ref(),
+                        ShapeCastOptions {
+                            max_time_of_impact: config.max_distance.real(),
+                            target_distance: config.target_distance.real(),
+                            stop_at_penetration: !config.ignore_origin_penetration,
+                            compute_impact_geometry_on_penetration: config
+                                .compute_contact_on_penetration,
+                        },
+                    ) else {
+                        return f32::MAX;
+                    };
+
+                    let toi = hit.time_of_impact.f32();
+                    if toi < closest_distance {
+                        closest_distance = toi;
+                        closest_hit = Some(ShapeHitData {
+                            entity: proxy.collider,
+                            point1: pose1 * hit.witness1,
+                            point2: pose2 * hit.witness2 + (direction * toi).real(),
+                            normal1: (pose1.rotation * hit.normal1).f32(),
+                            normal2: (pose2.rotation * hit.normal2).f32(),
+                            distance: toi,
+                        });
+                    }
+                    toi
+                },
+            );
+        });
+
+        closest_hit
     }
 
     /// Casts a [shape](spatial_query#shapecasting) with a given rotation and computes computes all [hits](ShapeHitData)
     /// in the order of distance until `max_hits` is reached.
+    ///
+    /// Note that the order of the results is not guaranteed, and if there are more hits than `max_hits`,
+    /// some hits will be missed.
     ///
     /// # Arguments
     ///
@@ -506,14 +619,14 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Shape properties
     ///     let shape = Collider::sphere(0.5);
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let rotation = Quat::default();
     ///     let direction = Dir3::X;
     ///
@@ -540,27 +653,40 @@ impl SpatialQuery<'_, '_> {
     pub fn shape_hits(
         &self,
         shape: &Collider,
-        origin: Vector,
-        shape_rotation: RotationValue,
+        origin: RVector,
+        shape_rotation: impl Into<Rot>,
         direction: Dir,
         max_hits: u32,
         config: &ShapeCastConfig,
         filter: &SpatialQueryFilter,
     ) -> Vec<ShapeHitData> {
-        self.query_pipeline.shape_hits(
+        let mut hits = Vec::new();
+
+        self.shape_hits_callback(
             shape,
             origin,
             shape_rotation,
             direction,
-            max_hits,
             config,
             filter,
-        )
+            |hit| {
+                if hits.len() < max_hits as usize {
+                    hits.push(hit);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+
+        hits
     }
 
     /// Casts a [shape](spatial_query#shapecasting) with a given rotation and computes computes all [hits](ShapeHitData)
     /// in the order of distance, calling the given `callback` for each hit. The shapecast stops when
     /// `callback` returns false or all hits have been found.
+    ///
+    /// Note that the order of the results is not guaranteed.
     ///
     /// # Arguments
     ///
@@ -578,14 +704,14 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_hits(spatial_query: SpatialQuery) {
     ///     // Shape properties
     ///     let shape = Collider::sphere(0.5);
-    ///     let origin = Vec3::ZERO;
+    ///     let origin = RVec3::ZERO;
     ///     let rotation = Quat::default();
     ///     let direction = Dir3::X;
     ///
@@ -595,9 +721,9 @@ impl SpatialQuery<'_, '_> {
     ///
     ///     // Cast shape and get up to 20 hits
     ///     let mut hits = vec![];
-    ///     spatial_query.shape_hits_callback(&shape, origin, rotation, direction, 20, &config, &filter, |hit| {
+    ///     spatial_query.shape_hits_callback(&shape, origin, rotation, direction, &config, &filter, |hit| {
     ///         hits.push(hit);
-    ///         true
+    ///         hits.len() < 20
     ///     });
     ///
     ///     // Print hits
@@ -616,22 +742,68 @@ impl SpatialQuery<'_, '_> {
     pub fn shape_hits_callback(
         &self,
         shape: &Collider,
-        origin: Vector,
-        shape_rotation: RotationValue,
+        origin: RVector,
+        shape_rotation: impl Into<Rot>,
         direction: Dir,
         config: &ShapeCastConfig,
         filter: &SpatialQueryFilter,
-        callback: impl FnMut(ShapeHitData) -> bool,
+        mut callback: impl FnMut(ShapeHitData) -> bool,
     ) {
-        self.query_pipeline.shape_hits_callback(
-            shape,
-            origin,
-            shape_rotation,
-            direction,
-            config,
-            filter,
-            callback,
-        )
+        let shape_rotation = shape_rotation.into();
+
+        let aabb = obvhs::aabb::Aabb::from(shape.aabb(origin, shape_rotation, 0.0));
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.sweep_traverse_all(
+                aabb,
+                direction,
+                config.max_distance,
+                config.target_distance,
+                |proxy_id| {
+                    let proxy = tree.get_proxy(proxy_id).unwrap();
+
+                    if !filter.test(proxy.collider, proxy.layers) {
+                        return true;
+                    }
+
+                    let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider)
+                    else {
+                        return true;
+                    };
+
+                    let pose1 = make_pose(position.0, *rotation);
+                    let pose2 = make_pose(origin, shape_rotation);
+
+                    let Ok(Some(hit)) = parry::query::cast_shapes(
+                        &pose1,
+                        RVector::ZERO,
+                        collider.shape_scaled().as_ref(),
+                        &pose2,
+                        direction.real(),
+                        shape.shape_scaled().as_ref(),
+                        ShapeCastOptions {
+                            max_time_of_impact: config.max_distance.real(),
+                            target_distance: config.target_distance.real(),
+                            stop_at_penetration: !config.ignore_origin_penetration,
+                            compute_impact_geometry_on_penetration: config
+                                .compute_contact_on_penetration,
+                        },
+                    ) else {
+                        return true;
+                    };
+
+                    let toi = hit.time_of_impact.f32();
+                    callback(ShapeHitData {
+                        entity: proxy.collider,
+                        point1: position.0 + rotation.real() * hit.witness1,
+                        point2: pose2 * hit.witness2 + (direction * toi).real(),
+                        normal1: (pose1.rotation * hit.normal1).f32(),
+                        normal2: (pose2.rotation * hit.normal2).f32(),
+                        distance: toi,
+                    })
+                },
+            );
+        });
     }
 
     /// Finds the [projection](spatial_query#point-projection) of a given point on the closest [collider](Collider).
@@ -650,14 +822,14 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_point_projection(spatial_query: SpatialQuery) {
     ///     // Project a point and print the result
     ///     if let Some(projection) = spatial_query.project_point(
-    ///         Vec3::ZERO,                    // Point
+    ///         RVec3::ZERO,                   // Point
     ///         true,                          // Are colliders treated as "solid"
     ///         &SpatialQueryFilter::default(),// Query filter
     ///     ) {
@@ -671,11 +843,11 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::project_point_predicate`]
     pub fn project_point(
         &self,
-        point: Vector,
+        point: RVector,
         solid: bool,
         filter: &SpatialQueryFilter,
     ) -> Option<PointProjection> {
-        self.query_pipeline.project_point(point, solid, filter)
+        self.project_point_predicate(point, solid, filter, &|_| true)
     }
 
     /// Finds the [projection](spatial_query#point-projection) of a given point on the closest [collider](Collider).
@@ -695,20 +867,20 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
     /// #[derive(Component)]
     /// struct Invisible;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_point_projection(spatial_query: SpatialQuery, query: Query<&Invisible>) {
     ///     // Project a point and print the result
     ///     if let Some(projection) = spatial_query.project_point_predicate(
-    ///         Vec3::ZERO,                    // Point
-    ///         true,                          // Are colliders treated as "solid"
-    ///         SpatialQueryFilter::default(), // Query filter
-    ///         &|entity| {                    // Predicate
+    ///         RVec3::ZERO,                    // Point
+    ///         true,                           // Are colliders treated as "solid"
+    ///         &SpatialQueryFilter::default(), // Query filter
+    ///         &|entity| {                     // Predicate
     ///             // Skip entities with the `Invisible` component.
     ///             !query.contains(entity)
     ///         }
@@ -723,13 +895,42 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::project_point`]
     pub fn project_point_predicate(
         &self,
-        point: Vector,
+        point: RVector,
         solid: bool,
         filter: &SpatialQueryFilter,
         predicate: &dyn Fn(Entity) -> bool,
     ) -> Option<PointProjection> {
-        self.query_pipeline
-            .project_point_predicate(point, solid, filter, predicate)
+        let mut closest_distance_squared = f32::INFINITY;
+        let mut closest_projection: Option<PointProjection> = None;
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.squared_distance_traverse_closest(point, f32::INFINITY, |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+                if !filter.test(proxy.collider, proxy.layers) || !predicate(proxy.collider) {
+                    return f32::INFINITY;
+                }
+
+                let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider) else {
+                    return f32::INFINITY;
+                };
+
+                let (projection, is_inside) =
+                    collider.project_point(position.0, *rotation, point, solid);
+
+                let distance_squared = (projection - point).length_squared().f32();
+                if distance_squared < closest_distance_squared {
+                    closest_distance_squared = distance_squared;
+                    closest_projection = Some(PointProjection {
+                        entity: proxy.collider,
+                        point: projection,
+                        is_inside,
+                    });
+                }
+                distance_squared
+            });
+        });
+
+        closest_projection
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [collider](Collider)
@@ -746,13 +947,13 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_point_intersections(spatial_query: SpatialQuery) {
     ///     let intersections =
-    ///         spatial_query.point_intersections(Vec3::ZERO, &SpatialQueryFilter::default());
+    ///         spatial_query.point_intersections(RVec3::ZERO, &SpatialQueryFilter::default());
     ///
     ///     for entity in intersections.iter() {
     ///         println!("Entity: {}", entity);
@@ -763,8 +964,15 @@ impl SpatialQuery<'_, '_> {
     /// # Related Methods
     ///
     /// - [`SpatialQuery::point_intersections_callback`]
-    pub fn point_intersections(&self, point: Vector, filter: &SpatialQueryFilter) -> Vec<Entity> {
-        self.query_pipeline.point_intersections(point, filter)
+    pub fn point_intersections(&self, point: RVector, filter: &SpatialQueryFilter) -> Vec<Entity> {
+        let mut intersections = vec![];
+
+        self.point_intersections_callback(point, filter, |entity| {
+            intersections.push(entity);
+            true
+        });
+
+        intersections
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [collider](Collider)
@@ -783,15 +991,15 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_point_intersections(spatial_query: SpatialQuery) {
     ///     let mut intersections = vec![];
     ///     
     ///     spatial_query.point_intersections_callback(
-    ///         Vec3::ZERO,                     // Point
+    ///         RVec3::ZERO,                    // Point
     ///         &SpatialQueryFilter::default(), // Query filter
     ///         |entity| {                      // Callback function
     ///             intersections.push(entity);
@@ -810,12 +1018,29 @@ impl SpatialQuery<'_, '_> {
     /// - [`SpatialQuery::point_intersections`]
     pub fn point_intersections_callback(
         &self,
-        point: Vector,
+        point: RVector,
         filter: &SpatialQueryFilter,
-        callback: impl FnMut(Entity) -> bool,
+        mut callback: impl FnMut(Entity) -> bool,
     ) {
-        self.query_pipeline
-            .point_intersections_callback(point, filter, callback)
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.point_traverse(point.f32(), |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+
+                if !filter.test(proxy.collider, proxy.layers) {
+                    return true;
+                }
+
+                let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider) else {
+                    return true;
+                };
+
+                if collider.contains_point(position.0, *rotation, point) {
+                    callback(proxy.collider)
+                } else {
+                    true
+                }
+            });
+        });
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [`ColliderAabb`]
@@ -827,12 +1052,12 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_aabb_intersections(spatial_query: SpatialQuery) {
-    ///     let aabb = Collider::sphere(0.5).aabb(Vec3::ZERO, Quat::default());
+    ///     let aabb = Collider::sphere(0.5).aabb(RVec3::ZERO, Quat::default(), 0.0);
     ///     let intersections = spatial_query.aabb_intersections_with_aabb(aabb);
     ///
     ///     for entity in intersections.iter() {
@@ -845,7 +1070,14 @@ impl SpatialQuery<'_, '_> {
     ///
     /// - [`SpatialQuery::aabb_intersections_with_aabb_callback`]
     pub fn aabb_intersections_with_aabb(&self, aabb: ColliderAabb) -> Vec<Entity> {
-        self.query_pipeline.aabb_intersections_with_aabb(aabb)
+        let mut intersections = vec![];
+
+        self.aabb_intersections_with_aabb_callback(aabb, |entity| {
+            intersections.push(entity);
+            true
+        });
+
+        intersections
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [`ColliderAabb`]
@@ -858,15 +1090,15 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_aabb_intersections(spatial_query: SpatialQuery) {
     ///     let mut intersections = vec![];
     ///
     ///     spatial_query.aabb_intersections_with_aabb_callback(
-    ///         Collider::sphere(0.5).aabb(Vec3::ZERO, Quat::default()),
+    ///         Collider::sphere(0.5).aabb(RVec3::ZERO, Quat::default(), 0.0),
     ///         |entity| {
     ///             intersections.push(entity);
     ///             true
@@ -885,10 +1117,23 @@ impl SpatialQuery<'_, '_> {
     pub fn aabb_intersections_with_aabb_callback(
         &self,
         aabb: ColliderAabb,
-        callback: impl FnMut(Entity) -> bool,
+        mut callback: impl FnMut(Entity) -> bool,
     ) {
-        self.query_pipeline
-            .aabb_intersections_with_aabb_callback(aabb, callback)
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.aabb_traverse(obvhs::aabb::Aabb::from(aabb), |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+                let Ok(proxy_aabb) = self.aabbs.get(proxy.collider) else {
+                    return true;
+                };
+                // The proxy AABB is more tightly fitted to the collider than the AABB in the tree,
+                // so we need to do an additional AABB intersection test here.
+                if proxy_aabb.intersects(&aabb) {
+                    callback(proxy.collider)
+                } else {
+                    true
+                }
+            });
+        });
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [`Collider`]
@@ -907,14 +1152,14 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_shape_intersections(spatial_query: SpatialQuery) {
     ///     let intersections = spatial_query.shape_intersections(
     ///         &Collider::sphere(0.5),          // Shape
-    ///         Vec3::ZERO,                      // Shape position
+    ///         RVec3::ZERO,                     // Shape position
     ///         Quat::default(),                 // Shape rotation
     ///         &SpatialQueryFilter::default(),  // Query filter
     ///     );
@@ -931,12 +1176,24 @@ impl SpatialQuery<'_, '_> {
     pub fn shape_intersections(
         &self,
         shape: &Collider,
-        shape_position: Vector,
-        shape_rotation: RotationValue,
+        shape_position: RVector,
+        shape_rotation: impl Into<Rot>,
         filter: &SpatialQueryFilter,
     ) -> Vec<Entity> {
-        self.query_pipeline
-            .shape_intersections(shape, shape_position, shape_rotation, filter)
+        let mut intersections = vec![];
+
+        self.shape_intersections_callback(
+            shape,
+            shape_position,
+            shape_rotation,
+            filter,
+            |entity| {
+                intersections.push(entity);
+                true
+            },
+        );
+
+        intersections
     }
 
     /// An [intersection test](spatial_query#intersection-tests) that finds all entities with a [`Collider`]
@@ -957,16 +1214,16 @@ impl SpatialQuery<'_, '_> {
     /// # #[cfg(feature = "2d")]
     /// # use avian2d::prelude::*;
     /// # #[cfg(feature = "3d")]
-    /// use avian3d::prelude::*;
+    /// use avian3d::{math::RVec3, prelude::*};
     /// use bevy::prelude::*;
     ///
-    /// # #[cfg(all(feature = "3d", feature = "f32"))]
+    /// # #[cfg(feature = "3d")]
     /// fn print_shape_intersections(spatial_query: SpatialQuery) {
     ///     let mut intersections = vec![];
     ///
     ///     spatial_query.shape_intersections_callback(
     ///         &Collider::sphere(0.5),          // Shape
-    ///         Vec3::ZERO,                      // Shape position
+    ///         RVec3::ZERO,                     // Shape position
     ///         Quat::default(),                 // Shape rotation
     ///         &SpatialQueryFilter::default(),  // Query filter
     ///         |entity| {                       // Callback function
@@ -987,17 +1244,55 @@ impl SpatialQuery<'_, '_> {
     pub fn shape_intersections_callback(
         &self,
         shape: &Collider,
-        shape_position: Vector,
-        shape_rotation: RotationValue,
+        shape_position: RVector,
+        shape_rotation: impl Into<Rot>,
         filter: &SpatialQueryFilter,
-        callback: impl FnMut(Entity) -> bool,
+        mut callback: impl FnMut(Entity) -> bool,
     ) {
-        self.query_pipeline.shape_intersections_callback(
-            shape,
-            shape_position,
-            shape_rotation,
-            filter,
-            callback,
-        )
+        let shape_rotation = shape_rotation.into();
+
+        let aabb = obvhs::aabb::Aabb::from(shape.aabb(shape_position, shape_rotation, 0.0));
+
+        self.collider_trees.iter_trees().for_each(|tree| {
+            tree.aabb_traverse(aabb, |proxy_id| {
+                let proxy = tree.get_proxy(proxy_id).unwrap();
+                if !filter.test(proxy.collider, proxy.layers) {
+                    return true;
+                }
+
+                let Ok((position, rotation, collider)) = self.colliders.get(proxy.collider) else {
+                    return true;
+                };
+
+                if contact_query::intersection_test(
+                    collider,
+                    position.0,
+                    *rotation,
+                    shape,
+                    shape_position,
+                    shape_rotation,
+                )
+                .is_ok_and(|intersects| intersects)
+                {
+                    callback(proxy.collider)
+                } else {
+                    true
+                }
+            });
+        });
     }
+}
+
+/// The result of a [point projection](spatial_query#point-projection) on a [collider](Collider).
+#[derive(Clone, Debug, PartialEq, Reflect)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
+#[reflect(Debug, PartialEq)]
+pub struct PointProjection {
+    /// The entity of the collider that the point was projected onto.
+    pub entity: Entity,
+    /// The point where the point was projected.
+    pub point: RVector,
+    /// True if the point was inside of the collider.
+    pub is_inside: bool,
 }

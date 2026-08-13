@@ -102,7 +102,7 @@ use bevy::{ecs::system::ReadOnlySystemParam, prelude::*};
 /// }
 /// ```
 ///
-/// This is equivalent to manually replacing the default [`BroadPhasePlugin`] and [`NarrowPhasePlugin`]
+/// This is equivalent to manually replacing the default [`BvhBroadPhasePlugin`] and [`NarrowPhasePlugin`]
 /// with instances that have the desired hooks provided using generics.
 ///
 /// [`SystemParam`]: bevy::ecs::system::SystemParam
@@ -159,6 +159,8 @@ pub trait CollisionHooks: ReadOnlySystemParam + Send + Sync {
     /// - Only called if at least one entity in the contact pair is not [`RigidBody::Static`] and not [`Sleeping`].
     /// - Access to the [`ContactGraph`] resource is not allowed in this method.
     ///   Trying to access it will result in a panic.
+    /// - The commands should not spawn or despawn collider entities.
+    ///   Instead, manually queue entities for spawning or despawning at a later time if needed.
     fn filter_pairs(&self, collider1: Entity, collider2: Entity, commands: &mut Commands) -> bool {
         true
     }
@@ -180,6 +182,8 @@ pub trait CollisionHooks: ReadOnlySystemParam + Send + Sync {
     /// - Command execution order is unspecified if the `parallel` feature is enabled.
     /// - Access to the [`ContactGraph`] resource is not allowed in this method.
     ///   Trying to access it will result in a panic.
+    /// - The commands should not spawn or despawn collider entities.
+    ///   Instead, manually queue entities for spawning or despawning at a later time if needed.
     fn modify_contacts(&self, contacts: &mut ContactPair, commands: &mut Commands) -> bool {
         true
     }
@@ -217,8 +221,9 @@ impl CollisionHooks for () {}
 /// ```
 #[repr(transparent)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Component, Hash, Clone, Copy, PartialEq, Eq, Debug, Reflect)]
-#[reflect(opaque, Hash, PartialEq, Debug)]
+#[derive(Component, Hash, Clone, Copy, Default, PartialEq, Eq, Debug, Reflect)]
+#[component(immutable)]
+#[reflect(opaque, Hash, PartialEq, Debug, Default)]
 pub struct ActiveCollisionHooks(u8);
 
 bitflags::bitflags! {
